@@ -25,7 +25,9 @@
 
 #include <stdint.h>
 
+/* _Static_assert is C11; C++ uses static_assert */
 #ifdef __cplusplus
+#define _Static_assert static_assert
 extern "C" {
 #endif
 
@@ -142,7 +144,7 @@ _Static_assert(sizeof(nvme_aqa_t) == 4, "nvme_aqa_t must be 4 bytes");
 
 /* ------- Submission Queue Entry — 64 bytes ------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     /* Command Dword 0 */
     uint32_t opc    : 8;   /* Opcode */
     uint32_t fuse   : 2;   /* Fused Operation */
@@ -177,7 +179,7 @@ _Static_assert(sizeof(nvme_sq_entry_t) == 64, "nvme_sq_entry_t must be 64 bytes"
 
 /* ------- Completion Queue Entry — 16 bytes ------- */
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     uint32_t cdw0;          /* Command-specific result */
     uint32_t cdw1;          /* Reserved */
     uint16_t sqhd;          /* SQ Head Pointer */

@@ -56,15 +56,22 @@ cq_poll_result cq_poll_completion(gpu_nvme_queue *q, uint64_t timeout_cycles) {
          * On real hardware this goes through PCIe MMIO.
          * On simulator this reads from host pinned memory. */
         volatile nvme_cq_entry_t *cqe = &q->cq[q->cq_head];
-        uint16_t sp = mmio_read32((volatile uint32_t *)&cqe->status_phase) & 0xFFFF;
+
+        /* CQE DW3 (offset 12) contains cid[15:0] | status_phase[31:16].
+         * Read as a single aligned 32-bit word to avoid misaligned access
+         * on the uint16_t fields. */
+        volatile uint32_t *cqe_base = (volatile uint32_t *)cqe;
+        uint32_t dw3 = mmio_read32(&cqe_base[3]);
+        uint16_t sp = (uint16_t)(dw3 >> 16);
 
         /* Check phase bit */
         uint8_t phase = sp & 1;
         if (phase == q->cq_phase) {
-            /* New completion! Read the full CQE. */
-            result.cdw0   = mmio_read32((volatile uint32_t *)&cqe->cdw0);
-            result.sqhd   = (uint16_t)mmio_read32((volatile uint32_t *)&cqe->sqhd);
-            result.cid    = (uint16_t)(mmio_read32((volatile uint32_t *)&cqe->cid) & 0xFFFF);
+            /* New completion! Read the full CQE via aligned 32-bit reads. */
+            result.cdw0   = mmio_read32(&cqe_base[0]);
+            uint32_t dw2  = mmio_read32(&cqe_base[2]);
+            result.sqhd   = (uint16_t)(dw2 & 0xFFFF);
+            result.cid    = (uint16_t)(dw3 & 0xFFFF);
             result.status = (sp >> 1) & 0x7FFF;
             result.success = (result.status == 0);
             result.timed_out = false;

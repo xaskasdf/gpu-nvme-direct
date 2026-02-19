@@ -150,7 +150,9 @@ int main(int argc, char **argv) {
 
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
-    double gpu_clock_khz = static_cast<double>(prop.clockRate);  /* kHz */
+    int clock_rate_khz = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device_id));
+    double gpu_clock_khz = static_cast<double>(clock_rate_khz);  /* kHz */
     printf("[%s] GPU: %s, clock: %.0f MHz\n", METHOD, prop.name,
            gpu_clock_khz / 1000.0);
 
