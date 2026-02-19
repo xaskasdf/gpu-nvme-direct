@@ -127,6 +127,20 @@ if(NOT GPUNVME_USE_SIM)
         m
     )
     add_test(NAME test_single_block COMMAND test_single_block)
+
+    add_executable(test_multi_block tests/test_multi_block.cu)
+    target_include_directories(test_multi_block PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_multi_block PRIVATE
+        gpunvme_host
+        gpunvme_device
+        CUDA::cudart
+        stdc++
+        m
+    )
+    add_test(NAME test_multi_block COMMAND test_multi_block)
 endif()
 
 # ---------- Tools (Phase 1+) ----------

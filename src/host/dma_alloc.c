@@ -130,3 +130,100 @@ void gpunvme_dma_free(gpunvme_dma_buf_t *buf) {
 
     memset(buf, 0, sizeof(*buf));
 }
+
+/* ---- PRP List ---- */
+
+gpunvme_err_t gpunvme_prp_list_alloc(gpunvme_prp_list_t *prp, uint32_t max_pages) {
+    if (!prp || max_pages == 0) return GPUNVME_ERR_INVALID_PARAM;
+
+    memset(prp, 0, sizeof(*prp));
+
+    /* PRP list needs (max_pages - 1) entries: PRP1 covers the first page.
+     * Round up to whole page for alignment. */
+    uint32_t n_entries = max_pages - 1;
+    if (n_entries == 0) n_entries = 1;
+    size_t list_bytes = n_entries * sizeof(uint64_t);
+    if (list_bytes < 4096) list_bytes = 4096;  /* page-align */
+
+    if (cudaMallocHost((void **)&prp->list, list_bytes) != cudaSuccess)
+        return GPUNVME_ERR_NOMEM;
+
+    memset(prp->list, 0, list_bytes);
+    prp->max_entries = n_entries;
+
+    /* Resolve physical address of the PRP list itself */
+    gpunvme_err_t err = gpunvme_virt_to_phys(prp->list, &prp->list_phys);
+    if (err != GPUNVME_OK) {
+        cudaFreeHost(prp->list);
+        memset(prp, 0, sizeof(*prp));
+        return err;
+    }
+
+    return GPUNVME_OK;
+}
+
+gpunvme_err_t gpunvme_prp_list_build(gpunvme_prp_list_t *prp,
+                                      void *data_vaddr,
+                                      size_t transfer_bytes,
+                                      uint32_t page_size) {
+    if (!prp || !prp->list || !data_vaddr || transfer_bytes == 0)
+        return GPUNVME_ERR_INVALID_PARAM;
+
+    uint32_t n_pages = (transfer_bytes + page_size - 1) / page_size;
+    if (n_pages > prp->max_entries + 1)
+        return GPUNVME_ERR_INVALID_PARAM;
+
+    /* Open pagemap once for efficiency */
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) return GPUNVME_ERR_IO;
+
+    long sys_page_size = sysconf(_SC_PAGESIZE);
+    uint8_t *base = (uint8_t *)data_vaddr;
+
+    for (uint32_t i = 0; i < n_pages; i++) {
+        uint64_t vaddr_int = (uint64_t)(uintptr_t)(base + (uint64_t)i * page_size);
+        uint64_t page_index = vaddr_int / sys_page_size;
+
+        uint64_t entry;
+        if (pread(fd, &entry, sizeof(entry), page_index * sizeof(entry)) != sizeof(entry)) {
+            close(fd);
+            return GPUNVME_ERR_IO;
+        }
+
+        if (!(entry & (1ULL << 63))) {
+            fprintf(stderr, "dma: page %u not present (vaddr=%p)\n", i, (void *)vaddr_int);
+            close(fd);
+            return GPUNVME_ERR_DMA;
+        }
+
+        uint64_t pfn = entry & ((1ULL << 55) - 1);
+        uint64_t phys = pfn * sys_page_size + (vaddr_int % sys_page_size);
+
+        if (i == 0) {
+            prp->prp1 = phys;
+        } else {
+            prp->list[i - 1] = phys;
+        }
+    }
+
+    close(fd);
+
+    prp->n_entries = (n_pages > 1) ? n_pages - 1 : 0;
+
+    /* Set PRP2 */
+    if (n_pages <= 1) {
+        prp->prp2 = 0;
+    } else if (n_pages == 2) {
+        prp->prp2 = prp->list[0];  /* Direct physical address of second page */
+    } else {
+        prp->prp2 = prp->list_phys;  /* Physical address of PRP list */
+    }
+
+    return GPUNVME_OK;
+}
+
+void gpunvme_prp_list_free(gpunvme_prp_list_t *prp) {
+    if (!prp) return;
+    if (prp->list) cudaFreeHost(prp->list);
+    memset(prp, 0, sizeof(*prp));
+}

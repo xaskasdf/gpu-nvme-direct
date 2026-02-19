@@ -179,9 +179,19 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
             for (int i = 39; i >= 0 && ctrl->model[i] == ' '; i--)
                 ctrl->model[i] = '\0';
 
+            /* MDTS at offset 77 */
+            ctrl->mdts = id[77];
+            if (ctrl->mdts > 0) {
+                ctrl->max_transfer_bytes = ctrl->page_size * (1u << ctrl->mdts);
+            } else {
+                ctrl->max_transfer_bytes = 1u << 20; /* 1MB fallback if no limit */
+            }
+
             fprintf(stderr, "ctrl: Model:    %s\n", ctrl->model);
             fprintf(stderr, "ctrl: Serial:   %s\n", ctrl->serial);
             fprintf(stderr, "ctrl: Firmware: %s\n", ctrl->firmware);
+            fprintf(stderr, "ctrl: MDTS:     %u (%u KB max per command)\n",
+                    ctrl->mdts, ctrl->max_transfer_bytes / 1024);
         }
 
         cudaFreeHost(id_buf);

@@ -50,6 +50,8 @@ typedef struct {
     /* Identify data */
     uint32_t ns_size_blocks;      /* Namespace size in blocks */
     uint32_t block_size;          /* LBA data size (bytes) */
+    uint8_t  mdts;                /* Max Data Transfer Size (log2 pages, 0=no limit) */
+    uint32_t max_transfer_bytes;  /* Computed: min(2^mdts * page_size, 1MB fallback) */
     char model[41];               /* Controller model string */
     char serial[21];              /* Controller serial number */
     char firmware[9];             /* Firmware revision */
