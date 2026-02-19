@@ -10,43 +10,93 @@ lectura/escritura, eliminando al CPU del data path de storage.
 mediado por CPU (NVMe → host RAM → GPU VRAM). Queremos que la GPU hable
 directamente con el NVMe.
 
-## Hardware del usuario
+## Hardware
 
 | Componente | Detalle |
 |---|---|
-| GPU | NVIDIA RTX 3090 (GA102, sm_86, 24GB, Ampere) |
+| GPU | NVIDIA RTX 3090 (GA102, sm_86, 24GB, Ampere) at 0000:0a:00.0 |
 | CPU | AMD Ryzen 7 5800X (Zen 3, AM4) |
 | Plataforma | AMD B550/X570, PCIe 4.0 |
 | RAM | 48GB DDR4 |
-| NVMe test | PCIe 4.0 SSD dedicado (NO es el boot drive) |
-| OS | Ubuntu 24.04 LTS (bare metal, instalado en la NVMe) |
-| CUDA target | 12.4 |
-| Driver | 581.80 (o el que venga con Ubuntu) |
+| NVMe test | WD SN530 1TB at 0000:0b:00.0 (PCIe 3.0 x4, NVMe 1.4.0, ~3.5 GB/s seq) |
+| OS | Ubuntu 25.10 (kernel 6.17.0-14-generic) |
+| CUDA | 13.1 |
+| Driver | 590.48.01 (open kernel modules via DKMS, patched) |
+| Compiler | gcc-14 (gcc-15 incompatible con CUDA 13.1) |
 
-## Estado actual
+### PCIe Topology
+```
+Root Complex (AMD Matisse/Vermeer)
+├── Root Port 03.1 → GPU 0a:00.0   (PCIe 4.0 x16, CPU direct)
+└── Root Port 03.4 → NVMe 0b:00.0  (PCIe 3.0 x4, via B550 chipset)
+```
 
-### Código: COMPLETO (todas las fases implementadas)
-
-- **61 archivos**, ~10,200 líneas de código
-- Todo el código fue escrito pero **nunca compilado ni testeado**
-- El usuario va a instalar Ubuntu bare metal en la NVMe nueva y buildear desde ahí
-
-### Lo que falta hacer
-
-1. **Instalar Ubuntu 24.04** en la NVMe nueva (dual-boot con Windows)
-2. **Instalar CUDA toolkit 12.4** + build-essential + cmake
-3. **Build Phase 0** (simulador) — `cmake .. -DGPUNVME_USE_SIM=ON` — verificar que compila y pasan los tests
-4. **Iterar bugs de compilación** — es probable que haya errores ya que nunca se compiló
-5. **Build Phase 1+** (hardware real) — `cmake .. -DGPUNVME_USE_SIM=OFF`
-6. **Configurar VFIO** para la NVMe de test
-7. **Correr milestones de hardware** (check_p2p, test_bar_read, test_single_block)
-8. **Benchmarks** si los milestones pasan
+### P2P: Writes SI, Reads NO
+- GPU→NVMe **posted writes** (MemWr): funcionan a través del AMD data fabric
+- GPU→NVMe **non-posted reads** (MemRd): FAIL (CmpltTO, AMD root complex las droppea)
+- **Tier 1 funciona**: solo se necesitan doorbell writes, CQ se polea desde host pinned
 
 ### BIOS settings necesarios
-
 - Above 4G Decoding: **ON**
-- IOMMU: **OFF** (o `amd_iommu=off` en GRUB)
-- Secure Boot: **OFF** (para el kernel module)
+- IOMMU: **OFF** (`amd_iommu=off` en GRUB)
+- Secure Boot: **OFF**
+
+## Estado actual (2026-02-19)
+
+### Milestones completados
+
+1. ✅ Código completo (todas las fases)
+2. ✅ Phase 0 tests pasan (simulador)
+3. ✅ dump_bar0 lee registros NVMe desde CPU
+4. ✅ **cudaHostRegisterIoMemory funciona** (tras patchear nvidia DKMS)
+5. ✅ **GPU MMIO writes a BAR0 funcionan** (probado con CC y doorbells)
+6. ✅ **GPU lee un bloque del NVMe autónomamente** (test_single_block)
+
+### Lo que sigue: Multi-block reads → Layer loader para ntransformer
+
+El objetivo aplicado es **servir como backend de I/O para ntransformer** (`../ntransformer`),
+un inference engine que corre modelos de 70B parámetros en 24GB VRAM via layer streaming
+(SLEP — Streaming Layer Execution Pipeline).
+
+**Pipeline actual de ntransformer (con CPU bottleneck):**
+```
+NVMe → page cache → CPU memcpy → pinned staging → H2D DMA → GPU compute
+        (mmap)      (worker thread)   (1.3 GB×2)     (PCIe)
+```
+Resultado: 0.02 tok/s en 70B. El memcpy del CPU worker thread es el bottleneck.
+
+**Pipeline objetivo (GPU-autónomo, sin CPU en el data path):**
+```
+GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
+  (MMIO a BAR0)      (autónomo)   (sin CPU memcpy)    (lee directo)
+```
+
+**Roadmap inmediato:**
+
+| # | Paso | Estado | Descripción |
+|---|------|--------|-------------|
+| 1 | Multi-block read | ⬜ | Leer N bloques consecutivos (PRP lists para >8KB) |
+| 2 | Large sequential read | ⬜ | Leer ~669MB (1 layer Q6_K) con queue depth pipelining |
+| 3 | Benchmarks | ⬜ | Latencia y throughput: 1-bloque, N-bloques, secuencial grande |
+| 4 | Layer loader API | ⬜ | `gpunvme_load_layer(ctrl, lba_offset, size, dest_pinned)` |
+| 5 | ntransformer integración | ⬜ | Reemplazar `LayerStreamer` con gpu-nvme-direct backend |
+| 6 | Port ntransformer a Linux | ⬜ | Actualmente solo testeado en Windows/MSVC |
+
+### Números de referencia
+
+El SN530 es **PCIe 3.0 x4** (~3.5 GB/s seq read). El slot va por el chipset B550.
+
+| Ruta de datos | BW estimado | 1 layer (669MB) | 80 layers | tok/s |
+|---------------|-------------|-----------------|-----------|-------|
+| mmap+memcpy+H2D (actual ntransformer) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
+| gpu-nvme-direct Tier 1 (SN530 Gen3) | ~3-3.5 GB/s | ~200ms | 16s | 0.06 |
+| Tier 1 + compute overlap | ~3-3.5 GB/s | ~190ms oculto | 15s | 0.07 |
+| Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
+| **Con NVMe Gen4 x4 (futuro upgrade)** | ~6-7 GB/s | ~100ms | 8s | 0.12 |
+
+La ganancia real es **eliminar el CPU del data path** y el memcpy sincrónico.
+Un upgrade a NVMe Gen4 duplicaría el throughput.
+Para Q8_0 (70B = ~70GB, no cabe en 48GB RAM): el streaming desde NVMe es obligatorio.
 
 ## Estructura del proyecto
 
@@ -66,16 +116,35 @@ docs/               Diseño, referencia NVMe, safety, metodología benchmarks
 ## Build
 
 ```bash
-# Phase 0 (simulador, para verificar lógica sin hardware NVMe)
+# Phase 0 (simulador)
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug -DGPUNVME_USE_SIM=ON
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DGPUNVME_USE_SIM=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-14 \
+  -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build . -j$(nproc)
 ctest --output-on-failure
 
 # Phase 1+ (hardware real)
 mkdir build-hw && cd build-hw
-cmake .. -DCMAKE_BUILD_TYPE=Release -DGPUNVME_USE_SIM=OFF
+cmake .. -DCMAKE_BUILD_TYPE=Release -DGPUNVME_USE_SIM=OFF \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-14 \
+  -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build . -j$(nproc)
+
+# Correr test de hardware (necesita VFIO setup primero)
+sudo ./test_single_block 0000:0b:00.0
+```
+
+### Setup NVMe (después de cada reboot)
+```bash
+sudo modprobe vfio enable_unsafe_noiommu_mode=1
+sudo modprobe vfio-pci
+sudo bash scripts/setup_vfio.sh 0000:0b:00.0
+sudo sh -c 'echo on > /sys/bus/pci/devices/0000:0b:00.0/power/control'
+sudo setpci -s 0000:0b:00.0 0x84.W=0x0008   # Force D0
+sudo setpci -s 0000:0b:00.0 COMMAND=0x0006   # Memory + BusMaster enable
 ```
 
 ## Arquitectura técnica clave
@@ -153,26 +222,27 @@ NVIDIA deshabilita PCIe P2P DMA en GPUs GeForce. Estrategia de 3 niveles:
 - Phase bit tracking igual que el spec NVMe
 - Permite desarrollar y testear los GPU kernels sin hardware NVMe real
 
-## Desafío crítico: cudaHostRegisterIoMemory en RTX 3090
+## Desafío resuelto: cudaHostRegisterIoMemory en RTX 3090
 
-El paso más incierto es si `cudaHostRegisterIoMemory` funciona para mapear
-BAR0 del NVMe en el address space del GPU en una GeForce consumer.
+`cudaHostRegisterIoMemory` **SÍ funciona** en GeForce RTX 3090, pero requiere
+parchear el nvidia DKMS module (`os-mlock.c`) porque `follow_pfn()` fue removido
+en kernel 6.12+. Ver `docs/investigation-p2p-bar0.md` para detalles completos.
 
-- **Si funciona** → Tier 1 completo, GPU lee/escribe NVMe de forma autónoma
-- **Si falla** → Intentar con NVIDIA open-source kernel modules, o kernel module custom
-- **En cualquier caso** → Es un resultado de investigación válido
+**Resultado**: GPU puede escribir MMIO a NVMe BAR0 (doorbells, CC, etc.)
+y el NVMe responde correctamente. GPU reads fallan (CmpltTO en AMD platform)
+pero no se necesitan para Tier 1.
 
-El test es: `sudo ./build-hw/check_p2p 0000:XX:00.0`
+## Milestones completados
 
-## Milestones en orden
-
-1. ✅ Código completo (todo escrito, falta compilar)
-2. ⬜ Phase 0 tests pasan (test_nvme_structs + test_sim_basic)
-3. ⬜ dump_bar0 lee registros NVMe desde CPU
-4. ⬜ check_p2p — `cudaHostRegisterIoMemory` en BAR0 (MILESTONE 1)
-5. ⬜ test_bar_read — GPU lee NVMe Version register via MMIO
-6. ⬜ test_single_block — GPU lee un bloque del NVMe autónomamente (MILESTONE 2)
-7. ⬜ Benchmarks vs cuFile, cpu-memcpy, cpu-pinned
+1. ✅ Código completo
+2. ✅ Phase 0 tests pasan (simulador)
+3. ✅ dump_bar0 lee registros NVMe (VS=1.4.0, MQES=1024)
+4. ✅ cudaHostRegisterIoMemory funciona (tras parchear nvidia DKMS)
+5. ✅ GPU MMIO writes a BAR0 funcionan (CC.EN y doorbells verificados)
+6. ✅ **test_single_block: GPU lee un bloque del NVMe autónomamente**
+7. ⬜ Multi-block reads (PRP lists, queue depth pipelining)
+8. ⬜ Benchmarks vs cuFile, cpu-memcpy, cpu-pinned
+9. ⬜ Layer loader API para ntransformer
 
 ## Referencia rápida NVMe
 
@@ -211,35 +281,60 @@ El test es: `sudo ./build-hw/check_p2p 0000:XX:00.0`
 - **tinygrad P2P patch**: https://github.com/tinygrad/open-gpu-kernel-modules — parche para P2P en consumer GPUs
 - **NVIDIA open-gpu-kernel-modules**: https://github.com/NVIDIA/open-gpu-kernel-modules
 
-## Ideas futuras (post-milestones)
+## Roadmap activo: ntransformer integration
 
-- **GPU-native unikernel OS**: Si los milestones funcionan, la GPU puede ser un
-  procesador de I/O autónomo — base para un OS que corre enteramente en la GPU
-- **Multi-queue parallel reads**: Múltiples GPU threads con queues separadas para
-  maximizar throughput
-- **Warp-cooperative submission**: Un warp entero colabora para llenar y submitir SQ entries
-- **Write support**: Actualmente enfocado en reads, writes siguen la misma lógica
-- **Filesystem-aware reads**: Parsear FAT32/ext4 metadata desde la GPU para lectura
-  directa de archivos (no solo bloques raw)
-- **Model weight loader**: Aplicación práctica — cargar pesos de modelos de ML
-  directamente del NVMe al GPU VRAM sin CPU
+### ntransformer (`../ntransformer`)
+Inference engine custom C++/CUDA que corre Llama 70B en 24GB VRAM usando SLEP
+(Streaming Layer Execution Pipeline). Lee layers del disco uno a uno, ejecuta
+en GPU con double buffering. Actualmente usa mmap+memcpy+H2D (0.02 tok/s en 70B).
+
+### Objetivo
+Reemplazar el streaming backend de ntransformer con gpu-nvme-direct:
+- GPU inicia reads de layers directamente al NVMe
+- NVMe DMA a host pinned memory (Tier 1)
+- GPU lee data desde pinned sin intervención del CPU
+- Eliminar worker thread y staging buffers
+
+### Pasos técnicos
+1. **Multi-block read**: PRP lists para leer >4KB (una layer = ~669MB Q6_K)
+2. **Queue depth pipelining**: Submit N reads, poll completions, overlap con compute
+3. **Layer loader API**: Wrapper que toma offset+size en el GGUF file, mapea a LBAs
+4. **ntransformer backend**: Implementar `LayerStreamer` interface con gpunvme
+
+### Para Q8_0 (70B, ~70GB)
+- Cada layer: ~875MB
+- 80 layers × 875MB = 70GB (no cabe en 48GB RAM → DEBE streamear desde NVMe)
+- Con Q8 no hay warm page cache posible → gpu-nvme-direct es el camino
+
+## Ideas futuras (post-integración)
+
+- **GPU-native unikernel OS**: GPU como procesador de I/O autónomo
+- **Multi-queue parallel reads**: Múltiples GPU threads con queues separadas
+- **Warp-cooperative submission**: Un warp entero colabora en SQ entries
+- **Write support**: Writes siguen la misma lógica
+- **Filesystem-aware reads**: Parsear metadata desde la GPU
+- **Tier 2**: NVMe DMA directo a GPU VRAM (requiere nvidia_p2p patcheado)
 
 ## Convenciones del código
 
 - **C11** para host code, **C++17/CUDA 17** para GPU code
+- **gcc-14** requerido (gcc-15 incompatible con CUDA 13.1)
 - **sm_86** target (RTX 3090 Ampere)
 - Headers en `include/gpunvme/`, implementación en `src/`
 - GPU device code usa `.cuh` para headers, `.cu` para implementación
 - `GPUNVME_USE_SIM=1` macro controla si se usa simulador o hardware real
-- Todos los structs NVMe tienen `__attribute__((packed))` y static asserts de tamaño
+- Structs NVMe sin `packed` (removed — causa GPU misaligned access), con static asserts
+- Queue allocations deben ser >= 4096 bytes (page alignment para NVMe)
+- host_mmio_write64: dos writes de 32 bits (NVMe spec 3.1.1.1)
 - Error handling via `gpunvme_err_t` enum (include/gpunvme/error.h)
 - Scripts asumen bash, paths Linux, necesitan sudo para hardware
 
-## Notas sobre el entorno previo (WSL — ABANDONADO)
+## Bugs importantes resueltos
 
-WSL fue abandonado por estas razones:
-- No soporta PCIe passthrough (imposible para Phase 1+)
-- El disco virtual se llenó y corrompió al instalar CUDA toolkit
-- MSYS2/Git Bash en Windows manglea rutas Linux al pasar a wsl.exe
-
-Todo el desarrollo futuro es en Ubuntu bare metal.
+| Bug | Causa raíz | Fix |
+|-----|-----------|-----|
+| cudaHostRegisterIoMemory falla | `follow_pfn()` removed en kernel 6.12+ | Parche `os-mlock.c`: PFN desde `vm_pgoff` |
+| GPU reads → 0xffffffff | AMD root complex droppea non-posted P2P TLPs | No fix posible; Tier 1 solo usa writes |
+| Admin commands cuelgan | Admin CQ no page-aligned (0x...800) | Allocations >= 4096 bytes |
+| host_mmio_write64 corrupta | 64-bit write no atómica en NVMe | Dos 32-bit writes (low first) |
+| GPU reads crashean NVMe link | PCIe link error acumulado | Evitar GPU reads a BAR0; power cycle si ocurre |
