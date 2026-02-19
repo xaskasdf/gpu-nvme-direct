@@ -75,8 +75,8 @@ GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
 
 | # | Paso | Estado | Descripción |
 |---|------|--------|-------------|
-| 1 | Multi-block read | ⬜ | Leer N bloques consecutivos (PRP lists para >8KB) |
-| 2 | Large sequential read | ⬜ | Leer ~669MB (1 layer Q6_K) con queue depth pipelining |
+| 1 | Multi-block read | ✅ | PRP lists hasta MDTS=512KB (6/6 tests pass) |
+| 2 | Large sequential read | ✅ | 669MB (1 layer Q6_K) @ 2.1 GB/s, pipeline depth 32 |
 | 3 | Benchmarks | ⬜ | Latencia y throughput: 1-bloque, N-bloques, secuencial grande |
 | 4 | Layer loader API | ⬜ | `gpunvme_load_layer(ctrl, lba_offset, size, dest_pinned)` |
 | 5 | ntransformer integración | ⬜ | Reemplazar `LayerStreamer` con gpu-nvme-direct backend |
@@ -86,13 +86,14 @@ GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
 
 El SN530 es **PCIe 3.0 x4** (~3.5 GB/s seq read). El slot va por el chipset B550.
 
-| Ruta de datos | BW estimado | 1 layer (669MB) | 80 layers | tok/s |
-|---------------|-------------|-----------------|-----------|-------|
+| Ruta de datos | BW medido/estimado | 1 layer (669MB) | 80 layers | tok/s |
+|---------------|-------------------|-----------------|-----------|-------|
 | mmap+memcpy+H2D (actual ntransformer) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
-| gpu-nvme-direct Tier 1 (SN530 Gen3) | ~3-3.5 GB/s | ~200ms | 16s | 0.06 |
-| Tier 1 + compute overlap | ~3-3.5 GB/s | ~190ms oculto | 15s | 0.07 |
+| **gpu-nvme-direct Tier 1 (SN530 Gen3)** | **2.1 GB/s medido** | **315ms** | **25s** | **0.04** |
+| gpu-nvme-direct pico (128MB chunks) | 2.7 GB/s medido | ~248ms | ~20s | 0.05 |
+| Tier 1 + compute overlap | ~2.1-2.7 GB/s | ~250ms oculto | ~20s | 0.05 |
 | Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
-| **Con NVMe Gen4 x4 (futuro upgrade)** | ~6-7 GB/s | ~100ms | 8s | 0.12 |
+| **Con NVMe Gen4 x4 (futuro upgrade)** | ~4-6 GB/s | ~130ms | 10s | 0.10 |
 
 La ganancia real es **eliminar el CPU del data path** y el memcpy sincrónico.
 Un upgrade a NVMe Gen4 duplicaría el throughput.
@@ -240,9 +241,10 @@ pero no se necesitan para Tier 1.
 4. ✅ cudaHostRegisterIoMemory funciona (tras parchear nvidia DKMS)
 5. ✅ GPU MMIO writes a BAR0 funcionan (CC.EN y doorbells verificados)
 6. ✅ **test_single_block: GPU lee un bloque del NVMe autónomamente**
-7. ⬜ Multi-block reads (PRP lists, queue depth pipelining)
-8. ⬜ Benchmarks vs cuFile, cpu-memcpy, cpu-pinned
-9. ⬜ Layer loader API para ntransformer
+7. ✅ **Multi-block reads (PRP lists hasta MDTS=512KB, 6/6 tests)**
+8. ✅ **Large sequential reads: 669MB (1 layer) @ 2.1 GB/s, pipeline depth 32**
+9. ⬜ Benchmarks vs cuFile, cpu-memcpy, cpu-pinned
+10. ⬜ Layer loader API para ntransformer
 
 ## Referencia rápida NVMe
 
@@ -338,3 +340,6 @@ Reemplazar el streaming backend de ntransformer con gpu-nvme-direct:
 | Admin commands cuelgan | Admin CQ no page-aligned (0x...800) | Allocations >= 4096 bytes |
 | host_mmio_write64 corrupta | 64-bit write no atómica en NVMe | Dos 32-bit writes (low first) |
 | GPU reads crashean NVMe link | PCIe link error acumulado | Evitar GPU reads a BAR0; power cycle si ocurre |
+| Pipeline depth ≥4 timeout | NVMe completions out-of-order; `cq_poll_for_cid` descartaba CQEs | Usar `cq_poll_completion` (acepta cualquier CID) |
+| I/O SQ/CQ no page-aligned | cudaMallocHost suballocator (después de muchas allocs) | posix_memalign + mlock + cudaHostRegister |
+| PRP lists no page-aligned | Mismo suballocator issue | Pool allocation con posix_memalign |
