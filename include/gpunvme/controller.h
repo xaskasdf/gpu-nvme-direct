@@ -11,6 +11,7 @@
 #define GPUNVME_CONTROLLER_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "error.h"
 #include "nvme_regs.h"
 

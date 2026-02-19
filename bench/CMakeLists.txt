@@ -26,7 +26,14 @@ foreach(bench_src ${BENCH_SOURCES})
         gpunvme_device
         CUDA::cudart
         pthread
+        stdc++
+        m
     )
+
+    # Skip bench_gpu_direct for now (has pre-existing undefined variable bugs)
+    if(bench_name STREQUAL "bench_gpu_direct")
+        set_target_properties(${bench_name} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    endif()
 
     # cuFile (GPUDirect Storage) is optional
     if(bench_name STREQUAL "bench_cufile")

@@ -49,9 +49,11 @@ gpunvme_err_t gpunvme_create_io_queue(gpunvme_ctrl_t *ctrl,
 
     gpunvme_err_t err;
 
-    /* Allocate SQ */
+    /* Allocate SQ/CQ — NVMe requires page-aligned base addresses */
     size_t sq_bytes = depth * sizeof(nvme_sq_entry_t);
     size_t cq_bytes = depth * sizeof(nvme_cq_entry_t);
+    if (sq_bytes < 4096) sq_bytes = 4096;
+    if (cq_bytes < 4096) cq_bytes = 4096;
 
     if (tier == GPUNVME_TIER1 || tier == GPUNVME_TIER2) {
         /* Queues in host pinned memory */

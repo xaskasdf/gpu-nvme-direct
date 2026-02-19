@@ -45,8 +45,13 @@ static inline uint64_t host_mmio_read64(volatile void *addr) {
 }
 
 static inline void host_mmio_write64(volatile void *addr, uint64_t val) {
+    /* NVMe spec: 64-bit registers may not support atomic 64-bit writes.
+     * Write as two 32-bit writes, low dword first (NVMe spec 3.1.1.1). */
+    volatile uint32_t *addr32 = (volatile uint32_t *)addr;
     mmio_barrier();
-    *(volatile uint64_t *)addr = val;
+    addr32[0] = (uint32_t)(val & 0xFFFFFFFF);
+    mmio_barrier();
+    addr32[1] = (uint32_t)(val >> 32);
     mmio_barrier();
 }
 

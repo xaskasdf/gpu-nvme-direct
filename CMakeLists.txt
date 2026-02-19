@@ -112,5 +112,22 @@ endif()
 # ---------- Benchmarks (Phase 5) ----------
 add_subdirectory(bench)
 
+# ---------- Hardware Tests (Phase 1+) ----------
+if(NOT GPUNVME_USE_SIM)
+    add_executable(test_single_block tests/test_single_block.cu)
+    target_include_directories(test_single_block PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_single_block PRIVATE
+        gpunvme_host
+        gpunvme_device
+        CUDA::cudart
+        stdc++
+        m
+    )
+    add_test(NAME test_single_block COMMAND test_single_block)
+endif()
+
 # ---------- Tools (Phase 1+) ----------
 # Tools are built separately when needed on bare metal

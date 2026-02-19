@@ -283,6 +283,55 @@ The only GPU→BAR0 operation in steady-state is the doorbell write, which works
 
 ---
 
+## MILESTONE 2 ACHIEVED: GPU Autonomous NVMe Block Read
+
+**Date**: 2026-02-19
+
+The full Tier 1 pipeline is working end-to-end:
+
+```
+=== GPU Single Block Read Test ===
+ctrl: CAP: MQES=1024, DSTRD=0, TO=10000ms, page=4096B
+ctrl: Admin SQ phys=0x110e51000, CQ phys=0x110e52000
+ctrl: Controller enabled and ready
+ctrl: Model:    WDC WDS100T2B0C-00PXH0
+ctrl: Serial:   21245W803900
+ctrl: Firmware: 211210WD
+ctrl: Namespace 1: 1953525168 blocks, 512 bytes/block
+admin: Created I/O CQ 1 (size=64)
+admin: Created I/O SQ 1 (size=64, cqid=1)
+io_queue: Created I/O queue pair 1 (depth=64, tier=1)
+Launching GPU kernel to read LBA 0...
+GPU read succeeded! 1 blocks read.
+```
+
+### What happens:
+1. **CPU** initializes NVMe controller (reads CAP, sets CC, waits CSTS.RDY)
+2. **CPU** runs Identify Controller + Identify Namespace via admin commands
+3. **CPU** creates I/O queue pair (CQ first, then SQ)
+4. **GPU kernel** submits NVMe Read command (writes SQ entry to host pinned memory)
+5. **GPU kernel** rings SQ doorbell via **posted MMIO write** to NVMe BAR0
+6. **NVMe** DMA reads the SQ entry, processes Read, DMA writes data to host memory
+7. **NVMe** DMA writes CQ entry to host pinned memory
+8. **GPU kernel** polls CQ from host pinned memory, sees completion
+9. **CPU** reads data from host pinned memory buffer
+
+### Key bug fixed: Admin queue page alignment
+The admin CQ allocation was not page-aligned (0x...f800), violating NVMe spec
+requirement that ASQ/ACQ bits 11:0 must be 0. The NVMe controller masked the
+low bits, making ACQ point to the same address as ASQ. Admin commands hung
+because completions were written to the wrong memory location.
+
+**Fix**: Ensure all queue allocations are at least 4096 bytes (one page) so
+cudaMallocHost returns page-aligned addresses.
+
+### Verification
+Pre-filled data buffer with 0xDE before GPU read. After read completed, buffer
+contained 0x00 (actual disk data, LBA 0 is blank on this drive). Confirmed
+NVMe DMA wrote real data to the buffer.
+
+---
+
 ## Viable Approaches Forward
 
 ### Option A: Bypass libcuda.so with direct RM ioctls

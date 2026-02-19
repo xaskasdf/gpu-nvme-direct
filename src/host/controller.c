@@ -7,6 +7,7 @@
  */
 
 #include <gpunvme/controller.h>
+#include <gpunvme/dma.h>
 #include <gpunvme/mmio.h>
 #include <gpunvme/nvme_regs.h>
 #include <gpunvme/nvme_cmds.h>
@@ -74,28 +75,43 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
         if (err != GPUNVME_OK) return err;
     }
 
-    /* 4. Allocate Admin SQ/CQ in host pinned memory */
+    /* 4. Allocate Admin SQ/CQ in host pinned memory.
+     * NVMe spec requires ASQ and ACQ to be page-aligned (bits 11:0 = 0).
+     * cudaMallocHost may pack small allocations into the same page,
+     * so we allocate at least one full page (4096) for each queue. */
     ctrl->admin_sq_size = 32;
     ctrl->admin_cq_size = 32;
 
-    if (cudaMallocHost((void **)&ctrl->admin_sq,
-                       ctrl->admin_sq_size * sizeof(nvme_sq_entry_t)) != cudaSuccess) {
+    size_t sq_bytes = ctrl->admin_sq_size * sizeof(nvme_sq_entry_t);
+    size_t cq_bytes = ctrl->admin_cq_size * sizeof(nvme_cq_entry_t);
+    if (sq_bytes < 4096) sq_bytes = 4096;
+    if (cq_bytes < 4096) cq_bytes = 4096;
+
+    if (cudaMallocHost((void **)&ctrl->admin_sq, sq_bytes) != cudaSuccess) {
         return GPUNVME_ERR_NOMEM;
     }
-    memset((void *)ctrl->admin_sq, 0, ctrl->admin_sq_size * sizeof(nvme_sq_entry_t));
+    memset((void *)ctrl->admin_sq, 0, sq_bytes);
 
-    if (cudaMallocHost((void **)&ctrl->admin_cq,
-                       ctrl->admin_cq_size * sizeof(nvme_cq_entry_t)) != cudaSuccess) {
+    if (cudaMallocHost((void **)&ctrl->admin_cq, cq_bytes) != cudaSuccess) {
         cudaFreeHost((void *)ctrl->admin_sq);
         return GPUNVME_ERR_NOMEM;
     }
-    memset((void *)ctrl->admin_cq, 0, ctrl->admin_cq_size * sizeof(nvme_cq_entry_t));
+    memset((void *)ctrl->admin_cq, 0, cq_bytes);
 
-    /* Get physical addresses for admin queues.
-     * For a real implementation, use /proc/self/pagemap or kernel module.
-     * Here we set placeholders — the physical address resolution
-     * is handled by gpunvme_virt_to_phys() in dma_alloc.c. */
-    /* TODO: ctrl->admin_sq_phys = gpunvme_virt_to_phys(...) */
+    /* Get physical addresses for admin queues via /proc/self/pagemap */
+    gpunvme_err_t phys_err;
+    phys_err = gpunvme_virt_to_phys((void *)ctrl->admin_sq, &ctrl->admin_sq_phys);
+    if (phys_err != GPUNVME_OK) {
+        fprintf(stderr, "ctrl: Failed to resolve admin SQ physical address (need root?)\n");
+        return phys_err;
+    }
+    phys_err = gpunvme_virt_to_phys((void *)ctrl->admin_cq, &ctrl->admin_cq_phys);
+    if (phys_err != GPUNVME_OK) {
+        fprintf(stderr, "ctrl: Failed to resolve admin CQ physical address (need root?)\n");
+        return phys_err;
+    }
+    fprintf(stderr, "ctrl: Admin SQ phys=0x%lx, CQ phys=0x%lx\n",
+            (unsigned long)ctrl->admin_sq_phys, (unsigned long)ctrl->admin_cq_phys);
 
     /* 5. Set AQA (Admin Queue Attributes) */
     nvme_aqa_t aqa;
@@ -141,7 +157,8 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
             return GPUNVME_ERR_NOMEM;
 
         nvme_sq_entry_t cmd;
-        uint64_t id_phys = 0; /* TODO: resolve physical address */
+        uint64_t id_phys = 0;
+        gpunvme_virt_to_phys(id_buf, &id_phys);
         nvme_cmd_identify_controller(&cmd, ctrl->admin_cid++, id_phys);
 
         uint32_t cdw0;
@@ -177,7 +194,8 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
             return GPUNVME_ERR_NOMEM;
 
         nvme_sq_entry_t cmd;
-        uint64_t ns_phys = 0; /* TODO */
+        uint64_t ns_phys = 0;
+        gpunvme_virt_to_phys(ns_buf, &ns_phys);
         nvme_cmd_identify_namespace(&cmd, ctrl->admin_cid++, 1, ns_phys);
 
         uint32_t cdw0;

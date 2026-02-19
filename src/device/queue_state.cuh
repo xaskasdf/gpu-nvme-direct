@@ -9,13 +9,18 @@
 #ifndef GPUNVME_QUEUE_STATE_CUH
 #define GPUNVME_QUEUE_STATE_CUH
 
+#ifdef __cplusplus
 #include <cstdint>
+#else
+#include <stdint.h>
+#include <stdbool.h>
+#endif
 #include <gpunvme/nvme_regs.h>
 
 /* GPU-visible NVMe queue pair state.
  * This struct lives in device-accessible memory (pinned host or GPU VRAM).
  * The GPU kernel uses it to submit commands and poll completions. */
-struct gpu_nvme_queue {
+typedef struct gpu_nvme_queue {
     /* Queue memory pointers (mapped into GPU address space) */
     volatile nvme_sq_entry_t *sq;        /* Submission queue entries */
     volatile nvme_cq_entry_t *cq;        /* Completion queue entries */
@@ -45,7 +50,10 @@ struct gpu_nvme_queue {
 
     /* Timeout for polling (in GPU clock cycles, 0 = no timeout) */
     uint64_t poll_timeout_cycles;
-};
+} gpu_nvme_queue;
+
+/* Device-side helper functions (only available in CUDA compilation) */
+#ifdef __CUDACC__
 
 /* Advance SQ tail with wrap-around */
 __device__ __forceinline__
@@ -77,5 +85,7 @@ bool gpu_nvme_sq_has_room(const gpu_nvme_queue *q, uint16_t sq_head_from_cq) {
     uint16_t next = (q->sq_tail + 1) % q->sq_size;
     return next != sq_head_from_cq;
 }
+
+#endif /* __CUDACC__ */
 
 #endif /* GPUNVME_QUEUE_STATE_CUH */
