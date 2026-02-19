@@ -141,6 +141,20 @@ if(NOT GPUNVME_USE_SIM)
         m
     )
     add_test(NAME test_multi_block COMMAND test_multi_block)
+
+    add_executable(test_large_read tests/test_large_read.cu)
+    target_include_directories(test_large_read PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(test_large_read PRIVATE
+        gpunvme_host
+        gpunvme_device
+        CUDA::cudart
+        stdc++
+        m
+    )
+    add_test(NAME test_large_read COMMAND test_large_read)
 endif()
 
 # ---------- Tools (Phase 1+) ----------

@@ -71,6 +71,15 @@ uint16_t sq_submit_read(gpu_nvme_queue *q,
     /* Ensure all SQ entry writes are globally visible */
     __threadfence_system();
 
+    /* PCIe write flush: read from BAR0 to ensure SQ entry writes
+     * have reached DRAM before the doorbell write reaches the NVMe.
+     * Without this, the root complex may deliver the doorbell (posted write
+     * to NVMe BAR) before the SQ entry (posted write to host DRAM),
+     * causing the NVMe to DMA-read stale SQ data. */
+    if (q->pcie_flush_addr) {
+        volatile uint32_t __attribute__((unused)) flush = mmio_read32(q->pcie_flush_addr);
+    }
+
     /* Ring the doorbell */
     doorbell_write_sq_tail(q->doorbell_sq, q->sq_tail);
 
@@ -111,6 +120,9 @@ uint16_t sq_submit_write(gpu_nvme_queue *q,
     sqe->cdw15 = 0;
 
     __threadfence_system();
+    if (q->pcie_flush_addr) {
+        volatile uint32_t __attribute__((unused)) flush = mmio_read32(q->pcie_flush_addr);
+    }
     doorbell_write_sq_tail(q->doorbell_sq, q->sq_tail);
     __threadfence_system();
 

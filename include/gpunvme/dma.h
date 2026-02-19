@@ -79,6 +79,7 @@ typedef struct {
     uint64_t  prp2;           /* PRP2 value (second page phys or list phys) */
     uint32_t  n_entries;      /* Number of entries in list */
     uint32_t  max_entries;    /* Allocated capacity */
+    size_t    list_bytes;     /* Allocated size in bytes (for cleanup) */
 } gpunvme_prp_list_t;
 
 /*

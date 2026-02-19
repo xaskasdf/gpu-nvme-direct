@@ -20,6 +20,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <sys/mman.h>
 #include <cuda_runtime.h>
 
 /*
@@ -145,18 +146,38 @@ gpunvme_err_t gpunvme_prp_list_alloc(gpunvme_prp_list_t *prp, uint32_t max_pages
     size_t list_bytes = n_entries * sizeof(uint64_t);
     if (list_bytes < 4096) list_bytes = 4096;  /* page-align */
 
-    if (cudaMallocHost((void **)&prp->list, list_bytes) != cudaSuccess)
+    /* Use posix_memalign to guarantee page alignment for NVMe PRP list.
+     * cudaMallocHost's suballocator may return sub-page offsets after
+     * many allocations, violating NVMe PRP list alignment requirements. */
+    void *list_ptr = NULL;
+    if (posix_memalign(&list_ptr, 4096, list_bytes) != 0)
         return GPUNVME_ERR_NOMEM;
+    mlock(list_ptr, list_bytes);
+    if (cudaHostRegister(list_ptr, list_bytes, cudaHostRegisterDefault) != cudaSuccess) {
+        munlock(list_ptr, list_bytes);
+        free(list_ptr);
+        return GPUNVME_ERR_NOMEM;
+    }
+    prp->list = (uint64_t *)list_ptr;
 
     memset(prp->list, 0, list_bytes);
     prp->max_entries = n_entries;
+    prp->list_bytes = list_bytes;  /* Save for cleanup */
 
     /* Resolve physical address of the PRP list itself */
     gpunvme_err_t err = gpunvme_virt_to_phys(prp->list, &prp->list_phys);
     if (err != GPUNVME_OK) {
-        cudaFreeHost(prp->list);
+        cudaHostUnregister(prp->list);
+        munlock(prp->list, list_bytes);
+        free(prp->list);
         memset(prp, 0, sizeof(*prp));
         return err;
+    }
+
+    /* Verify page alignment */
+    if (prp->list_phys & 0xFFF) {
+        fprintf(stderr, "dma: WARNING: PRP list phys 0x%lx not page-aligned!\n",
+                (unsigned long)prp->list_phys);
     }
 
     return GPUNVME_OK;
@@ -224,6 +245,10 @@ gpunvme_err_t gpunvme_prp_list_build(gpunvme_prp_list_t *prp,
 
 void gpunvme_prp_list_free(gpunvme_prp_list_t *prp) {
     if (!prp) return;
-    if (prp->list) cudaFreeHost(prp->list);
+    if (prp->list) {
+        cudaHostUnregister(prp->list);
+        munlock(prp->list, prp->list_bytes);
+        free(prp->list);
+    }
     memset(prp, 0, sizeof(*prp));
 }

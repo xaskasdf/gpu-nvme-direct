@@ -48,6 +48,11 @@ typedef struct gpu_nvme_queue {
     uint32_t nsid;                       /* Namespace ID (usually 1) */
     uint32_t block_size;                 /* Bytes per LBA (typically 512 or 4096) */
 
+    /* PCIe flush: readable BAR0 register for write ordering.
+     * Read from this after SQ entry writes, before doorbell write,
+     * to ensure SQ data reaches DRAM before NVMe reads it. */
+    volatile uint32_t *pcie_flush_addr;
+
     /* Timeout for polling (in GPU clock cycles, 0 = no timeout) */
     uint64_t poll_timeout_cycles;
 } gpu_nvme_queue;
