@@ -1,0 +1,46 @@
+# Build directories
+build/
+build-hw/
+build-*/
+
+# Compiled objects
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+venv/
+
+# Benchmark output
+*.csv
+*.png
+*.pdf
+!bench/plot_results.py
+!bench/bench_sweep.py
+
+# Kernel module build artifacts
+kmod/.tmp_versions/
+kmod/*.mod
+kmod/*.mod.c
+kmod/*.cmd
+kmod/modules.order
+kmod/Module.symvers

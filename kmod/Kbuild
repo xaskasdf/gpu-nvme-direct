@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# gpu-nvme-direct kernel module
+#
+# Provides userspace access to NVMe BAR0 and GPU P2P DMA mapping
+# for direct GPU-to-NVMe data transfers.
+
+obj-m := gpunvme.o
+
+gpunvme-objs := gpunvme_main.o \
+                gpunvme_pci.o \
+                gpunvme_dma.o \
+                gpunvme_chrdev.o
+
+# NVIDIA GPU Direct headers (set NVIDIA_SRC to driver source location)
+ifdef NVIDIA_SRC
+  ccflags-y += -I$(NVIDIA_SRC)
+endif
+
+ccflags-y += -Wall -Werror
