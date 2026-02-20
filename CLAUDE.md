@@ -16,22 +16,30 @@ directamente con el NVMe.
 |---|---|
 | GPU | NVIDIA RTX 3090 (GA102, sm_86, 24GB, Ampere) at 0000:0a:00.0 |
 | CPU | AMD Ryzen 7 5800X (Zen 3, AM4) |
-| Plataforma | AMD B550/X570, PCIe 4.0 |
+| Motherboard | ASUS ROG STRIX B450-F GAMING II (B450, Rev 1.xx) |
 | RAM | 48GB DDR4 |
-| NVMe test | WD SN740 1TB at 0000:01:00.0 (PCIe 4.0 x4, NVMe 1.4.0, MDTS=1024KB) |
-| NVMe prev | WD SN530 1TB at 0000:0b:00.0 (PCIe 3.0 x4, NVMe 1.4.0, MDTS=512KB) — now boot drive |
+| NVMe test | WD SN740 512GB at 0000:01:00.0 (Gen4 x4 device, runs Gen3 on B450, MDTS=1024KB) |
+| NVMe boot | WD SN530 1TB at 0000:0b:00.0 (Gen3 x4, MDTS=512KB) |
 | OS | Ubuntu 25.10 (kernel 6.17.0-14-generic) |
 | CUDA | 13.1 |
 | Driver | 590.48.01 (open kernel modules via DKMS, patched) |
 | Compiler | gcc-14 (gcc-15 incompatible con CUDA 13.1) |
 
-### PCIe Topology
+### PCIe Topology (B450 — all Gen3, no Gen4)
 ```
-Root Complex (AMD Matisse/Vermeer)
-├── Root Port 03.1 → GPU 0a:00.0   (PCIe 4.0 x16, CPU direct)
-├── Root Port 01.1 → NVMe 01:00.0  (SN740 PCIe 4.0 x4, test drive, via B550 chipset)
-└── Root Port 03.4 → NVMe 0b:00.0  (SN530 PCIe 3.0 x4, boot drive)
+CPU Ryzen 5800X (24 PCIe lanes — all Gen3 on B450)
+├── 00:01.1 (x4 Gen3) → SN740 01:00.0  [M.2_1, CPU-direct, shares lanes with GPU]
+├── 00:01.3 (x4 Gen3) → B450 chipset   [USB, SATA, Ethernet → bus 02-09]
+├── 00:03.1 (x8 Gen3) → GPU   0a:00.0  [PCIEX16_1, CPU-direct, x8 due to M.2 sharing]
+└── 00:03.4 (x4 Gen3) → SN530 0b:00.0  [M.2_2, CPU-direct]
+
+Free slots (all chipset, Gen2):
+  PCIEX16_2 (x4 Gen2), PCIEX16_3 (x4 Gen2), PCIEX1_1/2/3 (x1 Gen2)
 ```
+
+**Nota**: B450 NO soporta Gen4. SN740 capped a 8GT/s (Gen3) por el board.
+GPU a x8 porque M.2_1 comparte lanes con PCIEX16_1. 3.35 GB/s = 96% del techo Gen3 x4.
+Upgrade a B550/X570 daría Gen4 x4 (~6-7 GB/s) y GPU x16.
 
 ### P2P: Writes SI, Reads NO
 - GPU→NVMe **posted writes** (MemWr): funcionan a través del AMD data fabric
@@ -95,16 +103,18 @@ GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
 | **SN740** | PCIe 4.0 x4 (via B550, downgraded 8GT/s) | 1024 KB | — | — | ~3.1 GB/s | **3.35 GB/s** |
 | SN530 | PCIe 3.0 x4 | 512 KB | 2.1 GB/s | 2.7 GB/s | 2.1 GB/s | — |
 
-**Nota**: SN740 LnkCap=16GT/s pero LnkSta=8GT/s (downgrade por B550 chipset upstream).
-Aún así, MDTS mayor (1024K vs 512K) da ~60% más throughput.
+**Nota**: SN740 LnkCap=16GT/s pero LnkSta=8GT/s (B450 no soporta Gen4).
+3.35 GB/s = 96% del techo Gen3 x4. MDTS mayor (1024K vs 512K) da ~60% más throughput que SN530.
+Con B550/X570 (Gen4 real), SN740 daría ~6-7 GB/s.
 
 ### Comparación de rutas de datos
 
 | Ruta de datos | BW medido/estimado | 1 layer (669MB) | 80 layers | tok/s |
 |---------------|-------------------|-----------------|-----------|-------|
 | mmap+memcpy+H2D (actual ntransformer) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
-| **gpu-nvme-direct Tier 1 (SN740)** | **3.35 GB/s medido** | **~200ms** | **~16s** | **0.06** |
-| **gpu-nvme-direct Tier 1 (SN530)** | **2.1 GB/s medido** | **315ms** | **25s** | **0.04** |
+| **gpu-nvme-direct (SN740, B450 Gen3)** | **3.35 GB/s medido** | **~200ms** | **~16s** | **0.06** |
+| gpu-nvme-direct (SN530, Gen3) | 2.1 GB/s medido | 315ms | 25s | 0.04 |
+| **gpu-nvme-direct (SN740 + B550 Gen4)** | **~6-7 GB/s estimado** | **~100ms** | **~8s** | **0.12** |
 | Tier 1 + compute overlap | ~3.0-3.4 GB/s | ~200ms oculto | ~16s | 0.06 |
 | Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
 
