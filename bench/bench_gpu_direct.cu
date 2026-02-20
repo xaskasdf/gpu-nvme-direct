@@ -1,9 +1,12 @@
 /*
  * gpu-nvme-direct: GPU-Direct NVMe I/O Benchmark
  *
- * Benchmarks GPU-initiated NVMe I/O where the GPU kernel directly
- * submits READ commands to the NVMe controller, rings doorbells,
- * and polls completions -- with zero CPU involvement in the I/O path.
+ * Benchmarks GPU-initiated NVMe I/O where a single GPU thread submits
+ * READ commands with pipelining, rings doorbells via MMIO, and polls
+ * completions -- with zero CPU involvement in the I/O path.
+ *
+ * Uses the proven sq_submit_read() + cq_poll_completion() path from
+ * test_large_read.cu.
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -18,121 +21,128 @@
 #include <gpunvme/error.h>
 #include <gpunvme/controller.h>
 #include <gpunvme/queue.h>
-#include <gpunvme/block_io.h>
 #include <gpunvme/nvme_regs.h>
 #include <gpunvme/dma.h>
 
 #include "bench_common.h"
 
-/* For simulator mode */
 #if GPUNVME_USE_SIM
 #include "sim/nvme_sim.h"
 #endif
 
 #include "device/queue_state.cuh"
+#include "device/mmio_ops.cuh"
+#include "device/sq_submit.cuh"
+#include "device/cq_poll.cuh"
 
-/* ------- Benchmark Kernel ------- */
+#if !GPUNVME_USE_SIM
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+/* ------- Kernel Parameters ------- */
+
+struct bench_params {
+    uint64_t *lba_array;        /* Per-op starting LBA (num_ops entries) */
+    uint64_t *prp1_array;       /* Per-buffer-slot PRP1 (pipeline_depth entries) */
+    uint64_t *prp2_array;       /* Per-buffer-slot PRP2 (pipeline_depth entries) */
+    uint32_t nlb_0based;        /* NVMe blocks per op minus 1 */
+    uint32_t num_ops;           /* Total operations to run */
+    uint32_t pipeline_depth;    /* Max in-flight commands */
+};
+
+struct bench_result {
+    uint32_t completed;
+    uint32_t error_code;        /* 0=ok, 2=timeout, 3=nvme_error */
+    uint16_t cqe_status;
+    uint64_t total_cycles;
+};
+
+/* ------- GPU Benchmark Kernel ------- */
 
 /*
- * Per-operation latency measurement kernel.
+ * Single-thread pipelined benchmark kernel.
  *
- * Each thread handles one I/O operation. For queue_depth > 1,
- * multiple threads submit concurrently. A GPU clock-based timer
- * measures per-operation latency.
+ * Submits up to pipeline_depth commands ahead, polls completions in
+ * order. Records per-completion poll latency in GPU clock cycles.
+ * Buffer slots are reused cyclically: op N uses slot (N % pipeline_depth).
  */
 __global__
-void bench_read_kernel(gpu_nvme_queue *q,
-                       uint64_t *lba_array,
-                       uint32_t blocks_per_op,
-                       uint64_t data_buf_phys,
-                       uint64_t data_buf_stride,
-                       float *latencies_ms,
-                       uint32_t num_ops,
-                       uint32_t *completed_ops) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_ops) return;
+void bench_read_pipelined(gpu_nvme_queue *q,
+                          bench_params *params,
+                          bench_result *result,
+                          uint64_t *latency_cycles) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
-    uint64_t slba = lba_array[tid];
-    uint64_t my_phys = data_buf_phys + tid * data_buf_stride;
+    result->completed = 0;
+    result->error_code = 0;
+    result->cqe_status = 0;
 
-    /* Clock-based per-operation timing */
-    clock_t t0 = clock();
+    uint32_t num_ops = params->num_ops;
+    uint32_t pipe = params->pipeline_depth;
+    uint32_t nlb = params->nlb_0based;
 
-    /* Build and submit READ command.
-     * We use a simplified inline path for benchmarking. */
-    volatile nvme_sq_entry_t *sqe = &q->sq[q->sq_tail % q->sq_size];
+    uint32_t submitted = 0;
+    uint32_t completed = 0;
 
-    /* Zero the entry */
-    volatile uint32_t *sqe32 = (volatile uint32_t *)sqe;
-    for (int w = 0; w < 16; w++) sqe32[w] = 0;
+    uint64_t t_start = clock64();
 
-    /* Build READ command inline */
-    uint16_t cid = (uint16_t)(atomicAdd((unsigned int *)&q->cid_counter, 1) & 0xFFFF);
+    while (completed < num_ops) {
+        /* Fill pipeline */
+        while (submitted < num_ops && (submitted - completed) < pipe) {
+            uint32_t idx = submitted;
+            uint32_t buf_slot = idx % pipe;
 
-    sqe32[0] = 0x02 | (((uint32_t)cid) << 16);  /* OPC=READ, CID */
-    sqe32[1] = q->nsid;                           /* NSID */
-    /* PRP1 (64-bit) at dwords 6-7 */
-    sqe32[6] = (uint32_t)(my_phys & 0xFFFFFFFF);
-    sqe32[7] = (uint32_t)(my_phys >> 32);
-    /* CDW10-11: starting LBA */
-    sqe32[10] = (uint32_t)(slba & 0xFFFFFFFF);
-    sqe32[11] = (uint32_t)(slba >> 32);
-    /* CDW12: NLB (0-based) */
-    sqe32[12] = blocks_per_op - 1;
-
-    /* Advance SQ tail and ring doorbell */
-    __threadfence_system();
-    uint16_t new_tail = (uint16_t)atomicAdd((unsigned int *)&q->sq_tail, 1);
-    new_tail = (new_tail + 1) % q->sq_size;
-    __threadfence_system();
-    *(q->doorbell_sq) = new_tail;
-    __threadfence_system();
-
-    /* Poll CQ for our CID */
-    uint64_t timeout_cycles = q->poll_timeout_cycles;
-    if (timeout_cycles == 0) timeout_cycles = 170000000ULL;
-
-    clock_t poll_start = clock();
-    bool found = false;
-
-    while (!found) {
-        clock_t now = clock();
-        if ((uint64_t)(now - poll_start) > timeout_cycles) {
-            /* Timeout */
-            break;
+            sq_submit_read(q,
+                params->lba_array[idx],
+                nlb,
+                params->prp1_array[buf_slot],
+                params->prp2_array[buf_slot]);
+            submitted++;
         }
 
-        volatile nvme_cq_entry_t *cqe = &q->cq[q->cq_head % q->cq_size];
-        uint16_t sp = cqe->status_phase;
-        uint8_t phase = sp & 1;
+        /* Poll for next completion */
+        uint64_t poll_start = clock64();
+        cq_poll_result cqr = cq_poll_completion(q, 3400000000ULL);
+        uint64_t poll_end = clock64();
 
-        if (phase == q->cq_phase) {
-            if (cqe->cid == cid) {
-                found = true;
-
-                /* Advance CQ head */
-                uint16_t new_head = (q->cq_head + 1) % q->cq_size;
-                q->cq_head = new_head;
-                if (new_head == 0) q->cq_phase ^= 1;
-
-                __threadfence_system();
-                *(q->doorbell_cq) = new_head;
-                __threadfence_system();
-            }
+        if (cqr.timed_out) {
+            result->completed = completed;
+            result->error_code = 2;
+            result->total_cycles = clock64() - t_start;
+            return;
         }
+        if (!cqr.success) {
+            result->completed = completed;
+            result->error_code = 3;
+            result->cqe_status = cqr.status;
+            result->total_cycles = clock64() - t_start;
+            return;
+        }
+
+        latency_cycles[completed] = poll_end - poll_start;
+        completed++;
     }
 
-    clock_t t1 = clock();
-
-    /* Convert GPU clock cycles to milliseconds.
-     * Note: clock() returns SM clock cycles. We store raw delta;
-     * the host converts to real time using the GPU clock rate. */
-    latencies_ms[tid] = (float)(t1 - t0);
-
-    if (found) {
-        atomicAdd(completed_ops, 1);
-    }
+    result->completed = completed;
+    result->total_cycles = clock64() - t_start;
 }
+
+/* ------- Helper: resolve physical address via pagemap ------- */
+
+#if !GPUNVME_USE_SIM
+static uint64_t virt_to_phys_pagemap(int pm_fd, void *vaddr) {
+    long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t va = (uint64_t)(uintptr_t)vaddr;
+    uint64_t page_idx = va / page_size;
+    uint64_t entry;
+    if (pread(pm_fd, &entry, 8, page_idx * 8) != 8) return 0;
+    if (!(entry & (1ULL << 63))) return 0;  /* page not present */
+    uint64_t pfn = entry & ((1ULL << 55) - 1);
+    return pfn * page_size + (va % page_size);
+}
+#endif
 
 /* ------- Main ------- */
 
@@ -144,33 +154,42 @@ int main(int argc, char **argv) {
            METHOD, format_block_size(cfg.block_size).c_str(),
            cfg.queue_depth, cfg.num_ops, cfg.pattern.c_str());
 
-    /* Query GPU clock rate for converting clock() ticks to time */
+    /* Query GPU clock rate */
     int device_id = 0;
     CUDA_CHECK(cudaSetDevice(device_id));
-
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device_id));
     int clock_rate_khz = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device_id));
-    double gpu_clock_khz = static_cast<double>(clock_rate_khz);  /* kHz */
-    printf("[%s] GPU: %s, clock: %.0f MHz\n", METHOD, prop.name,
-           gpu_clock_khz / 1000.0);
+    double gpu_clock_khz = static_cast<double>(clock_rate_khz);
+    printf("[%s] GPU clock: %.0f MHz\n", METHOD, gpu_clock_khz / 1000.0);
 
-    /* ------- Controller and Queue Setup ------- */
+    /* Shared variables across both paths */
+    uint32_t pipeline_depth = cfg.queue_depth;
+    gpu_nvme_queue *h_queue = nullptr;
+    uint32_t nvme_block_size = 512;
+    uint64_t max_lba = 0;
+    uint32_t max_transfer_bytes = 0;
+    int ret = EXIT_SUCCESS;
+
+    /* Per-slot PRP arrays */
+    uint64_t *prp1_arr = nullptr;
+    uint64_t *prp2_arr = nullptr;
+
+    /* HW-only resources */
+    void *data_buf = nullptr;
+    size_t data_buf_size = 0;
+    void *prp_pool = nullptr;
+    size_t prp_pool_bytes = 0;
 
 #if GPUNVME_USE_SIM
+    /* ===== Simulator path ===== */
     printf("[%s] Using NVMe simulator\n", METHOD);
 
-    uint32_t blocks_per_op = static_cast<uint32_t>(cfg.block_size / 512);
-    if (blocks_per_op == 0) blocks_per_op = 1;
-
-    /* Create simulator with enough capacity */
     nvme_sim_config_t sim_cfg = {};
     sim_cfg.num_blocks = 1024 * 1024;  /* 512 MB virtual device */
     sim_cfg.block_size = 512;
     sim_cfg.sq_size = 256;
     sim_cfg.cq_size = 256;
-    sim_cfg.latency_us = 10;  /* 10 us simulated latency */
+    sim_cfg.latency_us = 10;
 
     nvme_sim_t *sim = nvme_sim_create(&sim_cfg);
     if (!sim) {
@@ -178,8 +197,6 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    /* Set up GPU queue state */
-    gpu_nvme_queue *h_queue;
     CUDA_CHECK(cudaMallocHost(&h_queue, sizeof(gpu_nvme_queue)));
     memset(h_queue, 0, sizeof(gpu_nvme_queue));
 
@@ -198,243 +215,396 @@ int main(int argc, char **argv) {
     h_queue->cid_counter = 0;
     h_queue->nsid = 1;
     h_queue->block_size = sim_cfg.block_size;
+    h_queue->pcie_flush_addr = nullptr;
     h_queue->poll_timeout_cycles = 170000000ULL;
 
-    uint64_t data_buf_phys = nvme_sim_get_data_buf_phys(sim);
-    uint64_t max_lba = sim_cfg.num_blocks;
+    nvme_block_size = sim_cfg.block_size;
+    max_lba = sim_cfg.num_blocks;
+    max_transfer_bytes = 1024 * 1024;
+
+    /* Sim PRP: direct virtual addresses, single page only */
+    if (cfg.block_size > 4096) {
+        printf("[%s] WARNING: sim mode limited to 4K block size, clamping\n", METHOD);
+        cfg.block_size = 4096;
+    }
+
+    uint64_t data_base_phys = nvme_sim_get_data_buf_phys(sim);
+    CUDA_CHECK(cudaMallocHost(&prp1_arr, pipeline_depth * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMallocHost(&prp2_arr, pipeline_depth * sizeof(uint64_t)));
+    for (uint32_t i = 0; i < pipeline_depth; i++) {
+        prp1_arr[i] = data_base_phys + (uint64_t)i * cfg.block_size;
+        prp2_arr[i] = 0;
+    }
 
 #else
-    /* Real hardware path */
+    /* ===== Real hardware path ===== */
     printf("[%s] Using real NVMe hardware: %s\n", METHOD, cfg.device.c_str());
 
-    /* Map BAR0 -- requires gpunvme_host library and root privileges */
-    /* This is a placeholder for the real hardware init path.
-     * In production, this would:
-     *   1. Open VFIO device
-     *   2. Map BAR0 for CPU
-     *   3. Map BAR0 for GPU (via CUDA external memory or P2P)
-     *   4. Init controller
-     *   5. Create I/O queue
-     */
-    fprintf(stderr, "Error: real hardware mode requires bare-metal setup.\n"
-                    "Build with -DGPUNVME_USE_SIM=ON for simulator mode.\n");
-    return EXIT_FAILURE;
-#endif
+    /* Map BAR0 */
+    char bar_path[256];
+    snprintf(bar_path, sizeof(bar_path),
+             "/sys/bus/pci/devices/%s/resource0", cfg.device.c_str());
+
+    int bar_fd = open(bar_path, O_RDWR | O_SYNC);
+    if (bar_fd < 0) {
+        perror("open BAR0");
+        fprintf(stderr, "Hint: run with sudo, ensure VFIO setup for %s\n",
+                cfg.device.c_str());
+        return EXIT_FAILURE;
+    }
+
+    off_t bar_size = lseek(bar_fd, 0, SEEK_END);
+    volatile void *bar0 = mmap(NULL, bar_size, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, bar_fd, 0);
+    if (bar0 == MAP_FAILED) {
+        perror("mmap BAR0");
+        close(bar_fd);
+        return EXIT_FAILURE;
+    }
+
+    cudaError_t cerr = cudaHostRegister(
+        (void *)bar0, bar_size,
+        cudaHostRegisterIoMemory | cudaHostRegisterMapped);
+    if (cerr != cudaSuccess) {
+        fprintf(stderr, "cudaHostRegisterIoMemory failed: %s\n",
+                cudaGetErrorString(cerr));
+        munmap((void *)bar0, bar_size);
+        close(bar_fd);
+        return EXIT_FAILURE;
+    }
+
+    void *gpu_bar0;
+    cudaHostGetDevicePointer(&gpu_bar0, (void *)bar0, 0);
+
+    /* Init controller */
+    gpunvme_ctrl_t ctrl;
+    gpunvme_err_t err = gpunvme_ctrl_init(&ctrl, bar0, bar_size);
+    if (err != GPUNVME_OK) {
+        fprintf(stderr, "Controller init failed: %s\n", gpunvme_err_str(err));
+        cudaHostUnregister((void *)bar0);
+        munmap((void *)bar0, bar_size);
+        close(bar_fd);
+        return EXIT_FAILURE;
+    }
+    ctrl.bar0_gpu = gpu_bar0;
+
+    nvme_block_size = ctrl.block_size;
+    max_lba = ctrl.ns_size_blocks;
+    max_transfer_bytes = ctrl.max_transfer_bytes;
+
+    printf("[%s] NVMe: %s, block_size=%u, MDTS=%uK, capacity=%u blocks\n",
+           METHOD, ctrl.model, nvme_block_size,
+           max_transfer_bytes / 1024, (uint32_t)max_lba);
+
+    /* Clamp block_size to MDTS */
+    if (cfg.block_size > max_transfer_bytes) {
+        printf("[%s] WARNING: block_size %s exceeds MDTS %uK, clamping\n",
+               METHOD, format_block_size(cfg.block_size).c_str(),
+               max_transfer_bytes / 1024);
+        cfg.block_size = max_transfer_bytes;
+    }
+
+    /* Create I/O queue with headroom beyond pipeline depth */
+    uint16_t queue_size = (uint16_t)(pipeline_depth + 4);
+    if (queue_size < 16) queue_size = 16;
+
+    gpunvme_io_queue_t ioq;
+    err = gpunvme_create_io_queue(&ctrl, 1, queue_size, 4096, GPUNVME_TIER1, &ioq);
+    if (err != GPUNVME_OK) {
+        fprintf(stderr, "I/O queue creation failed: %s\n", gpunvme_err_str(err));
+        gpunvme_ctrl_shutdown(&ctrl);
+        cudaHostUnregister((void *)bar0);
+        munmap((void *)bar0, bar_size);
+        close(bar_fd);
+        return EXIT_FAILURE;
+    }
+    h_queue = ioq.gpu_queue;
+
+    /* Allocate data buffer: pipeline_depth slots * block_size */
+    data_buf_size = (size_t)pipeline_depth * cfg.block_size;
+    if (posix_memalign(&data_buf, 4096, data_buf_size) != 0) {
+        fprintf(stderr, "Data buffer allocation failed (%zu bytes)\n", data_buf_size);
+        gpunvme_delete_io_queue(&ctrl, &ioq);
+        gpunvme_ctrl_shutdown(&ctrl);
+        cudaHostUnregister((void *)bar0);
+        munmap((void *)bar0, bar_size);
+        close(bar_fd);
+        return EXIT_FAILURE;
+    }
+    mlock(data_buf, data_buf_size);
+    cudaHostRegister(data_buf, data_buf_size, cudaHostRegisterDefault);
+    memset(data_buf, 0xDE, data_buf_size);
+
+    /* Build PRP lists for each buffer slot */
+    CUDA_CHECK(cudaMallocHost(&prp1_arr, pipeline_depth * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMallocHost(&prp2_arr, pipeline_depth * sizeof(uint64_t)));
+    memset(prp1_arr, 0, pipeline_depth * sizeof(uint64_t));
+    memset(prp2_arr, 0, pipeline_depth * sizeof(uint64_t));
+
+    {
+        uint32_t pages_per_op = (cfg.block_size + ctrl.page_size - 1) / ctrl.page_size;
+
+        /* Allocate PRP list pool for multi-page transfers */
+        if (pages_per_op > 2) {
+            prp_pool_bytes = (size_t)pipeline_depth * 4096;
+            if (posix_memalign(&prp_pool, 4096, prp_pool_bytes) != 0) {
+                fprintf(stderr, "PRP pool allocation failed\n");
+                goto cleanup_hw;
+            }
+            mlock(prp_pool, prp_pool_bytes);
+            cudaHostRegister(prp_pool, prp_pool_bytes, cudaHostRegisterDefault);
+            memset(prp_pool, 0, prp_pool_bytes);
+        }
+
+        int pm_fd = open("/proc/self/pagemap", O_RDONLY);
+        if (pm_fd < 0) {
+            perror("pagemap");
+            fprintf(stderr, "Hint: run with sudo for /proc/self/pagemap access\n");
+            goto cleanup_hw;
+        }
+
+        for (uint32_t slot = 0; slot < pipeline_depth; slot++) {
+            uint8_t *chunk = (uint8_t *)data_buf + (size_t)slot * cfg.block_size;
+
+            for (uint32_t p = 0; p < pages_per_op; p++) {
+                uint64_t phys = virt_to_phys_pagemap(pm_fd,
+                    chunk + (size_t)p * ctrl.page_size);
+                if (phys == 0) {
+                    fprintf(stderr, "Failed to resolve phys addr for slot %u page %u\n",
+                            slot, p);
+                    close(pm_fd);
+                    goto cleanup_hw;
+                }
+
+                if (p == 0) {
+                    prp1_arr[slot] = phys;
+                } else if (pages_per_op == 2) {
+                    /* 2-page transfer: PRP2 = second page phys directly */
+                    prp2_arr[slot] = phys;
+                } else {
+                    /* Multi-page: write into PRP list */
+                    uint64_t *list = (uint64_t *)((uint8_t *)prp_pool
+                                     + (size_t)slot * 4096);
+                    list[p - 1] = phys;
+                }
+            }
+
+            if (pages_per_op <= 1) {
+                prp2_arr[slot] = 0;
+            } else if (pages_per_op > 2) {
+                /* PRP2 = physical address of this slot's PRP list page */
+                uint64_t *list = (uint64_t *)((uint8_t *)prp_pool
+                                 + (size_t)slot * 4096);
+                prp2_arr[slot] = virt_to_phys_pagemap(pm_fd, list);
+                if (prp2_arr[slot] == 0) {
+                    fprintf(stderr, "Failed to resolve PRP list phys for slot %u\n", slot);
+                    close(pm_fd);
+                    goto cleanup_hw;
+                }
+            }
+        }
+        close(pm_fd);
+
+        printf("[%s] PRP lists ready: %u buffer slots, %u pages/op\n",
+               METHOD, pipeline_depth, pages_per_op);
+    }
+
+#endif /* GPUNVME_USE_SIM */
 
     /* ------- Generate LBA Array ------- */
+    {
+        uint32_t blocks_per_op = static_cast<uint32_t>(cfg.block_size / nvme_block_size);
+        if (blocks_per_op == 0) blocks_per_op = 1;
 
-    uint64_t data_stride = cfg.block_size;
+        if (cfg.max_lba == 0) cfg.max_lba = max_lba;
 
-    if (cfg.max_lba == 0) {
-        cfg.max_lba = max_lba;
-    }
+        uint64_t lba_range = cfg.max_lba;
+        if (lba_range > blocks_per_op) lba_range -= blocks_per_op;
+        if (lba_range == 0) lba_range = 1;
 
-    /* Ensure we don't exceed device capacity */
-    uint64_t lba_range = cfg.max_lba - blocks_per_op;
-    if (lba_range == 0) lba_range = 1;
+        uint64_t *h_lba_array;
+        CUDA_CHECK(cudaMallocHost(&h_lba_array, cfg.num_ops * sizeof(uint64_t)));
 
-    uint64_t *h_lba_array;
-    CUDA_CHECK(cudaMallocHost(&h_lba_array, cfg.num_ops * sizeof(uint64_t)));
-
-    srand(42);  /* Deterministic seed */
-
-    if (cfg.pattern == "seq") {
-        for (uint32_t i = 0; i < cfg.num_ops; i++) {
-            h_lba_array[i] = (cfg.start_lba + (uint64_t)i * blocks_per_op) % cfg.max_lba;
+        srand(42);
+        if (cfg.pattern == "seq") {
+            for (uint32_t i = 0; i < cfg.num_ops; i++) {
+                h_lba_array[i] = (cfg.start_lba + (uint64_t)i * blocks_per_op)
+                                 % cfg.max_lba;
+            }
+        } else {
+            for (uint32_t i = 0; i < cfg.num_ops; i++) {
+                h_lba_array[i] = random_lba(lba_range);
+            }
         }
-    } else {
-        for (uint32_t i = 0; i < cfg.num_ops; i++) {
-            h_lba_array[i] = random_lba(lba_range);
-        }
-    }
 
-    /* Copy LBA array to device */
-    uint64_t *d_lba_array;
-    CUDA_CHECK(cudaMalloc(&d_lba_array, cfg.num_ops * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_lba_array, h_lba_array,
-                           cfg.num_ops * sizeof(uint64_t),
-                           cudaMemcpyHostToDevice));
+        /* Allocate kernel params and result */
+        bench_params *h_params;
+        bench_result *h_result;
+        CUDA_CHECK(cudaMallocHost(&h_params, sizeof(bench_params)));
+        CUDA_CHECK(cudaMallocHost(&h_result, sizeof(bench_result)));
 
-    /* Allocate latency array and completion counter */
-    float *d_latencies;
-    CUDA_CHECK(cudaMalloc(&d_latencies, cfg.num_ops * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_latencies, 0, cfg.num_ops * sizeof(float)));
+        h_params->lba_array = h_lba_array;
+        h_params->prp1_array = prp1_arr;
+        h_params->prp2_array = prp2_arr;
+        h_params->nlb_0based = blocks_per_op - 1;
+        h_params->num_ops = cfg.num_ops;
+        h_params->pipeline_depth = pipeline_depth;
 
-    uint32_t *d_completed;
-    CUDA_CHECK(cudaMalloc(&d_completed, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_completed, 0, sizeof(uint32_t)));
+        /* Per-completion latency storage */
+        uint64_t *h_latency_cycles;
+        CUDA_CHECK(cudaMallocHost(&h_latency_cycles, cfg.num_ops * sizeof(uint64_t)));
+        memset(h_latency_cycles, 0, cfg.num_ops * sizeof(uint64_t));
 
-    /* ------- Warmup ------- */
+        /* ------- Warmup ------- */
 
-    printf("[%s] Running %d warmup iterations...\n", METHOD, WARMUP_ITERATIONS);
+        printf("[%s] Running %d warmup ops...\n", METHOD, WARMUP_ITERATIONS);
 
-    for (int w = 0; w < WARMUP_ITERATIONS; w++) {
-        CUDA_CHECK(cudaMemset(d_completed, 0, sizeof(uint32_t)));
+        bench_params *h_warmup;
+        CUDA_CHECK(cudaMallocHost(&h_warmup, sizeof(bench_params)));
+        *h_warmup = *h_params;
+        h_warmup->num_ops = 1;
+        h_warmup->pipeline_depth = 1;
 
-        /* Launch with 1 thread for warmup (single op) */
-        bench_read_kernel<<<1, 1>>>(h_queue,
-                                     d_lba_array,
-                                     blocks_per_op,
-                                     data_buf_phys,
-                                     data_stride,
-                                     d_latencies,
-                                     1,
-                                     d_completed);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        /* Reset queue state for next warmup */
-        h_queue->sq_tail = 0;
-        h_queue->cq_head = 0;
-        h_queue->cq_phase = 1;
-        h_queue->cid_counter = 0;
-    }
-
-    /* ------- Benchmark ------- */
-
-    printf("[%s] Running %u operations...\n", METHOD, cfg.num_ops);
-
-    /* Reset state */
-    h_queue->sq_tail = 0;
-    h_queue->cq_head = 0;
-    h_queue->cq_phase = 1;
-    h_queue->cid_counter = 0;
-    CUDA_CHECK(cudaMemset(d_completed, 0, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(d_latencies, 0, cfg.num_ops * sizeof(float)));
-
-    /* Determine launch geometry.
-     * For qd=1: launch ops sequentially (1 thread at a time).
-     * For qd>1: launch batches of qd threads concurrently. */
-    CpuSample cpu_before = read_cpu_sample();
-    WallTimer wall;
-    GpuTimer gpu_timer;
-
-    wall.start();
-    gpu_timer.start();
-
-    if (cfg.queue_depth == 1) {
-        /* Serial: one op at a time for accurate per-op latency */
-        for (uint32_t op = 0; op < cfg.num_ops; op++) {
-            bench_read_kernel<<<1, 1>>>(h_queue,
-                                         d_lba_array + op,
-                                         blocks_per_op,
-                                         data_buf_phys,
-                                         data_stride,
-                                         d_latencies + op,
-                                         1,
-                                         d_completed);
+        bool warmup_ok = true;
+        for (int w = 0; w < WARMUP_ITERATIONS; w++) {
+            memset(h_result, 0, sizeof(bench_result));
+            bench_read_pipelined<<<1, 1>>>(h_queue, h_warmup, h_result, h_latency_cycles);
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            /* Reset queue head/tail for next operation in serial mode */
-            h_queue->sq_tail = 0;
-            h_queue->cq_head = 0;
-            h_queue->cq_phase = 1;
-        }
-    } else {
-        /* Batched: launch queue_depth threads per batch */
-        uint32_t ops_done = 0;
-        while (ops_done < cfg.num_ops) {
-            uint32_t batch = cfg.queue_depth;
-            if (ops_done + batch > cfg.num_ops) {
-                batch = cfg.num_ops - ops_done;
+            if (h_result->error_code != 0) {
+                fprintf(stderr, "[%s] Warmup op %d failed: error=%u, status=0x%04x\n",
+                        METHOD, w, h_result->error_code, h_result->cqe_status);
+                ret = EXIT_FAILURE;
+                warmup_ok = false;
+                break;
             }
+        }
 
-            /* Reset queue for each batch */
-            h_queue->sq_tail = 0;
-            h_queue->cq_head = 0;
-            h_queue->cq_phase = 1;
+        if (warmup_ok) {
+            printf("[%s] Warmup complete (queue at sq_tail=%u, cq_head=%u)\n",
+                   METHOD, h_queue->sq_tail, h_queue->cq_head);
 
-            bench_read_kernel<<<1, batch>>>(h_queue,
-                                              d_lba_array + ops_done,
-                                              blocks_per_op,
-                                              data_buf_phys,
-                                              data_stride,
-                                              d_latencies + ops_done,
-                                              batch,
-                                              d_completed);
+            /* ------- Benchmark ------- */
+
+            printf("[%s] Running %u operations (pipeline_depth=%u)...\n",
+                   METHOD, cfg.num_ops, pipeline_depth);
+
+            /* Do NOT reset queue state — the NVMe controller's internal pointers
+             * are at the position left by warmup. Resetting our head/tail/phase
+             * without resetting the controller causes completions to go to the
+             * wrong CQ slot (timeout). Let the queue roll naturally. */
+
+            memset(h_result, 0, sizeof(bench_result));
+            memset(h_latency_cycles, 0, cfg.num_ops * sizeof(uint64_t));
+            h_params->num_ops = cfg.num_ops;
+            h_params->pipeline_depth = pipeline_depth;
+
+            CpuSample cpu_before = read_cpu_sample();
+            WallTimer wall;
+            GpuTimer gpu_timer;
+
+            wall.start();
+            gpu_timer.start();
+
+            bench_read_pipelined<<<1, 1>>>(h_queue, h_params, h_result, h_latency_cycles);
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            ops_done += batch;
-        }
-    }
+            gpu_timer.stop();
+            wall.stop();
+            CpuSample cpu_after = read_cpu_sample();
 
-    gpu_timer.stop();
-    wall.stop();
-    CpuSample cpu_after = read_cpu_sample();
+            double wall_elapsed_sec = wall.elapsed_sec();
 
-    double gpu_elapsed_sec = gpu_timer.elapsed_sec();
-    double wall_elapsed_sec = wall.elapsed_sec();
+            printf("[%s] Completed: %u / %u ops (wall: %.3f s)\n",
+                   METHOD, h_result->completed, cfg.num_ops, wall_elapsed_sec);
 
-    /* Read back completions */
-    uint32_t h_completed = 0;
-    CUDA_CHECK(cudaMemcpy(&h_completed, d_completed, sizeof(uint32_t),
-                           cudaMemcpyDeviceToHost));
-
-    printf("[%s] Completed: %u / %u ops (GPU: %.3f s, wall: %.3f s)\n",
-           METHOD, h_completed, cfg.num_ops, gpu_elapsed_sec, wall_elapsed_sec);
-
-    /* Read back per-op latencies and convert from clock ticks to microseconds */
-    std::vector<float> h_latencies_raw(cfg.num_ops);
-    CUDA_CHECK(cudaMemcpy(h_latencies_raw.data(), d_latencies,
-                           cfg.num_ops * sizeof(float),
-                           cudaMemcpyDeviceToHost));
-
-    std::vector<double> latencies_us;
-    latencies_us.reserve(h_completed);
-
-    for (uint32_t i = 0; i < cfg.num_ops; i++) {
-        if (h_latencies_raw[i] > 0.0f) {
-            /* Convert GPU clock ticks to microseconds:
-             * ticks / (clock_rate_kHz * 1000) * 1e6 = ticks / clock_rate_kHz * 1000 */
-            double us = static_cast<double>(h_latencies_raw[i]) / gpu_clock_khz * 1000.0;
-            latencies_us.push_back(us);
-        }
-    }
-
-    /* ------- Compute and Output Stats ------- */
-
-    uint64_t total_bytes = static_cast<uint64_t>(h_completed) * cfg.block_size;
-    BenchStats stats = compute_stats(latencies_us, total_bytes, wall_elapsed_sec,
-                                      cpu_before, cpu_after);
-
-    print_stats(METHOD, cfg.block_size, cfg.queue_depth,
-                cfg.pattern.c_str(), stats);
-
-    /* Write CSV output */
-    if (!cfg.output.empty()) {
-        bool write_header = false;
-        FILE *fp = fopen(cfg.output.c_str(), "r");
-        if (!fp) {
-            write_header = true;
-        } else {
-            fclose(fp);
-        }
-
-        fp = fopen(cfg.output.c_str(), "a");
-        if (fp) {
-            if (write_header) {
-                write_csv_header(fp);
+            if (h_result->error_code != 0) {
+                fprintf(stderr, "[%s] ERROR: code=%u, cqe_status=0x%04x at op %u\n",
+                        METHOD, h_result->error_code, h_result->cqe_status,
+                        h_result->completed);
+                ret = EXIT_FAILURE;
             }
-            write_csv_row(fp, METHOD, cfg.block_size, cfg.queue_depth,
-                          cfg.pattern.c_str(), stats);
-            fclose(fp);
-            printf("[%s] Results appended to %s\n", METHOD, cfg.output.c_str());
-        } else {
-            fprintf(stderr, "Warning: could not open %s for writing\n",
-                    cfg.output.c_str());
+
+            /* Convert per-completion latencies from GPU cycles to microseconds */
+            std::vector<double> latencies_us;
+            latencies_us.reserve(h_result->completed);
+            for (uint32_t i = 0; i < h_result->completed; i++) {
+                double us = static_cast<double>(h_latency_cycles[i])
+                            / gpu_clock_khz * 1000.0;
+                latencies_us.push_back(us);
+            }
+
+            /* ------- Compute and Output Stats ------- */
+
+            uint64_t total_bytes = static_cast<uint64_t>(h_result->completed) * cfg.block_size;
+            BenchStats stats = compute_stats(latencies_us, total_bytes, wall_elapsed_sec,
+                                              cpu_before, cpu_after);
+
+            print_stats(METHOD, cfg.block_size, cfg.queue_depth,
+                        cfg.pattern.c_str(), stats);
+
+            /* Write CSV output */
+            if (!cfg.output.empty()) {
+                bool write_header = false;
+                FILE *fp = fopen(cfg.output.c_str(), "r");
+                if (!fp) {
+                    write_header = true;
+                } else {
+                    fclose(fp);
+                }
+
+                fp = fopen(cfg.output.c_str(), "a");
+                if (fp) {
+                    if (write_header) write_csv_header(fp);
+                    write_csv_row(fp, METHOD, cfg.block_size, cfg.queue_depth,
+                                  cfg.pattern.c_str(), stats);
+                    fclose(fp);
+                    printf("[%s] Results appended to %s\n", METHOD, cfg.output.c_str());
+                } else {
+                    fprintf(stderr, "Warning: could not open %s for writing\n",
+                            cfg.output.c_str());
+                }
+            }
         }
+
+        CUDA_CHECK(cudaFreeHost(h_warmup));
+        CUDA_CHECK(cudaFreeHost(h_lba_array));
+        CUDA_CHECK(cudaFreeHost(h_params));
+        CUDA_CHECK(cudaFreeHost(h_result));
+        CUDA_CHECK(cudaFreeHost(h_latency_cycles));
     }
 
-    /* ------- Cleanup ------- */
+    /* ------- Resource Cleanup ------- */
 
-    CUDA_CHECK(cudaFree(d_lba_array));
-    CUDA_CHECK(cudaFree(d_latencies));
-    CUDA_CHECK(cudaFree(d_completed));
-    CUDA_CHECK(cudaFreeHost(h_lba_array));
-    CUDA_CHECK(cudaFreeHost(h_queue));
+    CUDA_CHECK(cudaFreeHost(prp1_arr));
+    CUDA_CHECK(cudaFreeHost(prp2_arr));
 
 #if GPUNVME_USE_SIM
+    CUDA_CHECK(cudaFreeHost(h_queue));
     nvme_sim_destroy(sim);
+#else
+    goto cleanup_hw_done;
+
+cleanup_hw:
+    ret = EXIT_FAILURE;
+
+cleanup_hw_done:
+    if (prp_pool) {
+        cudaHostUnregister(prp_pool);
+        munlock(prp_pool, prp_pool_bytes);
+        free(prp_pool);
+    }
+    if (data_buf) {
+        cudaHostUnregister(data_buf);
+        munlock(data_buf, data_buf_size);
+        free(data_buf);
+    }
+    gpunvme_delete_io_queue(&ctrl, &ioq);
+    gpunvme_ctrl_shutdown(&ctrl);
+    cudaHostUnregister((void *)bar0);
+    munmap((void *)bar0, bar_size);
+    close(bar_fd);
 #endif
 
-    return EXIT_SUCCESS;
+    return ret;
 }

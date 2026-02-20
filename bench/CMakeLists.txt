@@ -30,9 +30,11 @@ foreach(bench_src ${BENCH_SOURCES})
         m
     )
 
-    # Skip bench_gpu_direct for now (has pre-existing undefined variable bugs)
-    if(bench_name STREQUAL "bench_gpu_direct")
-        set_target_properties(${bench_name} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+    # bench_gpu_direct needs gpunvme_host for real hardware mode
+    if(bench_name STREQUAL "bench_gpu_direct" AND NOT GPUNVME_USE_SIM)
+        if(TARGET gpunvme_host)
+            target_link_libraries(${bench_name} PRIVATE gpunvme_host)
+        endif()
     endif()
 
     # cuFile (GPUDirect Storage) is optional

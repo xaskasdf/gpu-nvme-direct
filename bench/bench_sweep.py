@@ -156,7 +156,7 @@ def detect_outliers(throughputs):
 # ------- Run a Single Benchmark -------
 
 def run_benchmark(bench_bin, block_size, queue_depth, pattern, num_ops,
-                  output_csv, device, extra_args=None):
+                  output_csv, device, use_sudo=False, extra_args=None):
     """Run a single benchmark invocation and return True on success."""
     cmd = [
         str(bench_bin),
@@ -169,6 +169,9 @@ def run_benchmark(bench_bin, block_size, queue_depth, pattern, num_ops,
     ]
     if extra_args:
         cmd.extend(extra_args)
+
+    if use_sudo:
+        cmd = ["sudo"] + cmd
 
     print(f"  CMD: {' '.join(cmd)}")
 
@@ -295,7 +298,12 @@ def main():
     )
     parser.add_argument(
         "--device", type=str, default="/dev/nvme0n1",
-        help="NVMe device path (default: /dev/nvme0n1)"
+        help="NVMe device path for CPU benchmarks (default: /dev/nvme0n1)"
+    )
+    parser.add_argument(
+        "--bdf", type=str, default=None,
+        help="PCI BDF for gpu_direct benchmark (e.g., 0000:0b:00.0). "
+             "If not set, gpu_direct is skipped."
     )
     parser.add_argument(
         "--num-ops", type=int, default=1000,
@@ -349,6 +357,10 @@ def main():
             print(f"ERROR: unknown benchmark '{name}'. "
                   f"Options: {', '.join(BENCHMARKS.keys())}")
             sys.exit(1)
+        # gpu_direct requires --bdf
+        if name == "gpu_direct" and not args.bdf:
+            print(f"NOTE: skipping gpu_direct (no --bdf specified)")
+            continue
         bin_path = bench_dir / BENCHMARKS[name]
         if not bin_path.exists() and not args.dry_run:
             print(f"WARNING: {bin_path} not found, skipping '{name}'")
@@ -414,10 +426,18 @@ def main():
                         if run_csv.exists():
                             run_csv.unlink()
 
+                        # gpu_direct uses BDF and needs sudo
+                        if bench_name == "gpu_direct":
+                            device = args.bdf
+                            use_sudo = True
+                        else:
+                            device = args.device
+                            use_sudo = False
+
                         success = run_benchmark(
                             bench_bin, bs, qd, pattern,
                             args.num_ops, str(run_csv),
-                            args.device,
+                            device, use_sudo=use_sudo,
                         )
 
                         if not success:
