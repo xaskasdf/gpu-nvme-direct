@@ -83,6 +83,12 @@ if(NOT GPUNVME_USE_SIM)
         CUDA::cudart
         pthread
     )
+
+    add_library(gpunvme_layer_loader STATIC src/host/layer_loader.cu)
+    target_include_directories(gpunvme_layer_loader PUBLIC
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(gpunvme_layer_loader PUBLIC
+        gpunvme_host gpunvme_device CUDA::cudart)
 endif()
 
 # ---------- Tests ----------
@@ -155,6 +161,13 @@ if(NOT GPUNVME_USE_SIM)
         m
     )
     add_test(NAME test_large_read COMMAND test_large_read)
+
+    add_executable(test_layer_loader tests/test_layer_loader.cu)
+    target_include_directories(test_layer_loader PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_layer_loader PRIVATE
+        gpunvme_layer_loader gpunvme_host gpunvme_device CUDA::cudart stdc++ m)
+    add_test(NAME test_layer_loader COMMAND test_layer_loader)
 endif()
 
 # ---------- Tools (Phase 1+) ----------

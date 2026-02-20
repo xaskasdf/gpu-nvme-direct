@@ -18,7 +18,8 @@ directamente con el NVMe.
 | CPU | AMD Ryzen 7 5800X (Zen 3, AM4) |
 | Plataforma | AMD B550/X570, PCIe 4.0 |
 | RAM | 48GB DDR4 |
-| NVMe test | WD SN530 1TB at 0000:0b:00.0 (PCIe 3.0 x4, NVMe 1.4.0, ~3.5 GB/s seq) |
+| NVMe test | WD SN740 1TB at 0000:01:00.0 (PCIe 4.0 x4, NVMe 1.4.0, MDTS=1024KB) |
+| NVMe prev | WD SN530 1TB at 0000:0b:00.0 (PCIe 3.0 x4, NVMe 1.4.0, MDTS=512KB) — now boot drive |
 | OS | Ubuntu 25.10 (kernel 6.17.0-14-generic) |
 | CUDA | 13.1 |
 | Driver | 590.48.01 (open kernel modules via DKMS, patched) |
@@ -28,7 +29,8 @@ directamente con el NVMe.
 ```
 Root Complex (AMD Matisse/Vermeer)
 ├── Root Port 03.1 → GPU 0a:00.0   (PCIe 4.0 x16, CPU direct)
-└── Root Port 03.4 → NVMe 0b:00.0  (PCIe 3.0 x4, via B550 chipset)
+├── Root Port 01.1 → NVMe 01:00.0  (SN740 PCIe 4.0 x4, test drive, via B550 chipset)
+└── Root Port 03.4 → NVMe 0b:00.0  (SN530 PCIe 3.0 x4, boot drive)
 ```
 
 ### P2P: Writes SI, Reads NO
@@ -41,7 +43,7 @@ Root Complex (AMD Matisse/Vermeer)
 - IOMMU: **OFF** (`amd_iommu=off` en GRUB)
 - Secure Boot: **OFF**
 
-## Estado actual (2026-02-19)
+## Estado actual (2026-02-20)
 
 ### Milestones completados
 
@@ -51,8 +53,12 @@ Root Complex (AMD Matisse/Vermeer)
 4. ✅ **cudaHostRegisterIoMemory funciona** (tras patchear nvidia DKMS)
 5. ✅ **GPU MMIO writes a BAR0 funcionan** (probado con CC y doorbells)
 6. ✅ **GPU lee un bloque del NVMe autónomamente** (test_single_block)
+7. ✅ **Multi-block reads** (PRP lists hasta MDTS, 6/6 tests)
+8. ✅ **Large sequential reads** (669MB @ 2.1 GB/s en SN530, pipeline depth 32)
+9. ✅ **Layer Loader API** (`gpunvme_layer_loader_init/load_layer/destroy`)
+10. ✅ **SN740 validado** (8.6GB @ 3.35 GB/s sustained, 3/3 tests)
 
-### Lo que sigue: Multi-block reads → Layer loader para ntransformer
+### Lo que sigue: ntransformer integration
 
 El objetivo aplicado es **servir como backend de I/O para ntransformer** (`../ntransformer`),
 un inference engine que corre modelos de 70B parámetros en 24GB VRAM via layer streaming
@@ -71,40 +77,50 @@ GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
   (MMIO a BAR0)      (autónomo)   (sin CPU memcpy)    (lee directo)
 ```
 
-**Roadmap inmediato:**
+**Roadmap:**
 
 | # | Paso | Estado | Descripción |
 |---|------|--------|-------------|
-| 1 | Multi-block read | ✅ | PRP lists hasta MDTS=512KB (6/6 tests pass) |
-| 2 | Large sequential read | ✅ | 669MB (1 layer Q6_K) @ 2.1 GB/s, pipeline depth 32 |
-| 3 | Benchmarks | ⬜ | Latencia y throughput: 1-bloque, N-bloques, secuencial grande |
-| 4 | Layer loader API | ⬜ | `gpunvme_load_layer(ctrl, lba_offset, size, dest_pinned)` |
+| 1 | Multi-block read | ✅ | PRP lists hasta MDTS (6/6 tests pass) |
+| 2 | Large sequential read | ✅ | 669MB @ 2.1 GB/s (SN530), pipeline depth 32 |
+| 3 | Layer loader API | ✅ | `gpunvme_layer_loader_init/load_layer/destroy` — 3-call reusable API |
+| 4 | SN740 validation | ✅ | 8.6GB @ 3.35 GB/s sustained (PCIe 4.0, MDTS=1024KB) |
 | 5 | ntransformer integración | ⬜ | Reemplazar `LayerStreamer` con gpu-nvme-direct backend |
 | 6 | Port ntransformer a Linux | ⬜ | Actualmente solo testeado en Windows/MSVC |
 
-### Números de referencia
+### Throughput medido (gpu-nvme-direct Layer Loader)
 
-El SN530 es **PCIe 3.0 x4** (~3.5 GB/s seq read). El slot va por el chipset B550.
+| NVMe | Interfaz | MDTS | 4 MB | 128 MB | 669 MB | 8.6 GB |
+|------|----------|------|------|--------|--------|--------|
+| **SN740** | PCIe 4.0 x4 (via B550, downgraded 8GT/s) | 1024 KB | — | — | ~3.1 GB/s | **3.35 GB/s** |
+| SN530 | PCIe 3.0 x4 | 512 KB | 2.1 GB/s | 2.7 GB/s | 2.1 GB/s | — |
+
+**Nota**: SN740 LnkCap=16GT/s pero LnkSta=8GT/s (downgrade por B550 chipset upstream).
+Aún así, MDTS mayor (1024K vs 512K) da ~60% más throughput.
+
+### Comparación de rutas de datos
 
 | Ruta de datos | BW medido/estimado | 1 layer (669MB) | 80 layers | tok/s |
 |---------------|-------------------|-----------------|-----------|-------|
 | mmap+memcpy+H2D (actual ntransformer) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
-| **gpu-nvme-direct Tier 1 (SN530 Gen3)** | **2.1 GB/s medido** | **315ms** | **25s** | **0.04** |
-| gpu-nvme-direct pico (128MB chunks) | 2.7 GB/s medido | ~248ms | ~20s | 0.05 |
-| Tier 1 + compute overlap | ~2.1-2.7 GB/s | ~250ms oculto | ~20s | 0.05 |
+| **gpu-nvme-direct Tier 1 (SN740)** | **3.35 GB/s medido** | **~200ms** | **~16s** | **0.06** |
+| **gpu-nvme-direct Tier 1 (SN530)** | **2.1 GB/s medido** | **315ms** | **25s** | **0.04** |
+| Tier 1 + compute overlap | ~3.0-3.4 GB/s | ~200ms oculto | ~16s | 0.06 |
 | Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
-| **Con NVMe Gen4 x4 (futuro upgrade)** | ~4-6 GB/s | ~130ms | 10s | 0.10 |
 
 La ganancia real es **eliminar el CPU del data path** y el memcpy sincrónico.
-Un upgrade a NVMe Gen4 duplicaría el throughput.
 Para Q8_0 (70B = ~70GB, no cabe en 48GB RAM): el streaming desde NVMe es obligatorio.
+
+### GGUF de prueba en NVMe
+- **llama-3.1-8b-instruct-q8_0.gguf** (8.5GB) escrito en SN740 con `dd` a LBA 0
+- Usado para validar Layer Loader: 3/3 tests pass, 8614 MB @ 3350 MB/s
 
 ## Estructura del proyecto
 
 ```
-include/gpunvme/    Headers públicos (nvme_regs.h, nvme_cmds.h, controller.h, queue.h, etc.)
+include/gpunvme/    Headers públicos (nvme_regs.h, nvme_cmds.h, controller.h, queue.h, layer_loader.h)
 src/device/         GPU-side CUDA (mmio_ops.cuh, sq_submit.cuh, cq_poll.cuh, block_io.cu)
-src/host/           CPU-side C (controller.c, admin.c, io_queue.c, bar_map.c, dma_alloc.c)
+src/host/           CPU-side C/CUDA (controller.c, admin.c, io_queue.c, layer_loader.cu)
 src/sim/            Simulador NVMe en software (nvme_sim.c/h)
 kmod/               Kernel module Linux (PCI probe, char device, nvidia_p2p DMA)
 bench/              Benchmarks (gpu-direct, cuFile, cpu-memcpy, cpu-pinned, sweep, plots)
@@ -134,18 +150,20 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DGPUNVME_USE_SIM=OFF \
   -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build . -j$(nproc)
 
-# Correr test de hardware (necesita VFIO setup primero)
-sudo ./test_single_block 0000:0b:00.0
+# Correr tests de hardware (necesita VFIO setup primero)
+sudo ./test_single_block 0000:01:00.0
+sudo ./test_layer_loader 0000:01:00.0        # Layer Loader API (3 tests)
+sudo ./test_layer_loader 0000:01:00.0 669    # Full layer size
 ```
 
 ### Setup NVMe (después de cada reboot)
 ```bash
 sudo modprobe vfio enable_unsafe_noiommu_mode=1
 sudo modprobe vfio-pci
-sudo bash scripts/setup_vfio.sh 0000:0b:00.0
-sudo sh -c 'echo on > /sys/bus/pci/devices/0000:0b:00.0/power/control'
-sudo setpci -s 0000:0b:00.0 0x84.W=0x0008   # Force D0
-sudo setpci -s 0000:0b:00.0 COMMAND=0x0006   # Memory + BusMaster enable
+sudo bash scripts/setup_vfio.sh 0000:01:00.0
+sudo sh -c 'echo on > /sys/bus/pci/devices/0000:01:00.0/power/control'
+sudo setpci -s 0000:01:00.0 0x84.W=0x0008   # Force D0
+sudo setpci -s 0000:01:00.0 COMMAND=0x0006   # Memory + BusMaster enable
 ```
 
 ## Arquitectura técnica clave
@@ -241,10 +259,11 @@ pero no se necesitan para Tier 1.
 4. ✅ cudaHostRegisterIoMemory funciona (tras parchear nvidia DKMS)
 5. ✅ GPU MMIO writes a BAR0 funcionan (CC.EN y doorbells verificados)
 6. ✅ **test_single_block: GPU lee un bloque del NVMe autónomamente**
-7. ✅ **Multi-block reads (PRP lists hasta MDTS=512KB, 6/6 tests)**
-8. ✅ **Large sequential reads: 669MB (1 layer) @ 2.1 GB/s, pipeline depth 32**
-9. ⬜ Benchmarks vs cuFile, cpu-memcpy, cpu-pinned
-10. ⬜ Layer loader API para ntransformer
+7. ✅ **Multi-block reads** (PRP lists hasta MDTS, 6/6 tests)
+8. ✅ **Large sequential reads**: 669MB @ 2.1 GB/s (SN530), pipeline depth 32
+9. ✅ **Layer Loader API**: 3-call reusable interface (`init/load_layer/destroy`)
+10. ✅ **SN740 validated**: 8.6GB @ 3.35 GB/s sustained (PCIe 4.0, MDTS=1024KB)
+11. ⬜ ntransformer integración (reemplazar LayerStreamer)
 
 ## Referencia rápida NVMe
 
