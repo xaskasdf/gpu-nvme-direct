@@ -16,8 +16,12 @@ PWD  := $(shell pwd)
 #   make NVIDIA_SRC=/usr/src/nvidia-550.54.14
 NVIDIA_SRC ?=
 
+# Path to NVIDIA Module.symvers (auto-detected from DKMS)
+NVIDIA_SYMVERS ?= $(wildcard /var/lib/dkms/nvidia/*/$(shell uname -r)/x86_64/module/Module.symvers)
+
 # Export for Kbuild
 export NVIDIA_SRC
+export NVIDIA_SYMVERS
 
 .PHONY: all modules clean install help
 

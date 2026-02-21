@@ -70,6 +70,7 @@ struct gpunvme_dev {
 /* ---- gpunvme_main.c ---- */
 extern struct class *gpunvme_class;
 extern int gpunvme_major;
+const char *gpunvme_get_target_bdf(void);
 
 /* ---- gpunvme_pci.c ---- */
 int gpunvme_pci_register(void);

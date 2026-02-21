@@ -14,7 +14,12 @@ gpunvme-objs := gpunvme_main.o \
 
 # NVIDIA GPU Direct headers (set NVIDIA_SRC to driver source location)
 ifdef NVIDIA_SRC
-  ccflags-y += -I$(NVIDIA_SRC)
+  ccflags-y += -I$(NVIDIA_SRC) -DHAVE_NV_P2P_H
+endif
+
+# nvidia_p2p_* symbols — pass NVIDIA_SYMVERS from outer Makefile
+ifdef NVIDIA_SYMVERS
+  KBUILD_EXTRA_SYMBOLS += $(NVIDIA_SYMVERS)
 endif
 
 ccflags-y += -Wall -Werror
