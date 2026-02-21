@@ -18,11 +18,14 @@ designed for consumer hardware (RTX 3090).
 
 | Component | Detail |
 |-----------|--------|
-| GPU | NVIDIA RTX 3090 (GA102, sm_86, 24GB) |
-| CPU | AMD Ryzen 7 5800X (Zen 3) |
-| NVMe | Dedicated test SSD, PCIe 4.0 (**not** the boot drive) |
-| OS | Ubuntu 24.04 (bare metal) |
-| CUDA | 12.4 |
+| GPU | NVIDIA RTX 3090 (GA102, sm_86, 24GB) at 0000:0a:00.0 |
+| CPU | AMD Ryzen 7 5800X (Zen 3, AM4) |
+| Motherboard | ASUS ROG STRIX B450-F GAMING II (B450 — all Gen3) |
+| NVMe test | WD SN740 512GB at 0000:01:00.0 (Gen4 device, runs Gen3 on B450) |
+| NVMe boot | WD SN530 1TB at 0000:0b:00.0 (Gen3 x4) |
+| OS | Ubuntu 25.10 (kernel 6.17, bare metal) |
+| CUDA | 13.1 |
+| Driver | 590.48.01 (open kernel modules, patched for `cudaHostRegisterIoMemory`) |
 
 ## Architecture
 
@@ -67,34 +70,49 @@ scripts/            Setup/teardown scripts (VFIO, prereqs, kernel module)
 docs/               Architecture design, NVMe reference, safety, benchmarks
 ```
 
+## Measured Throughput
+
+| NVMe | Interface | MDTS | Sustained | Notes |
+|------|-----------|------|-----------|-------|
+| **SN740** | Gen4 x4 (Gen3 on B450) | 1024K | **3.35 GB/s** | 96% of Gen3 x4 max |
+| SN530 | Gen3 x4 | 512K | 2.1 GB/s | Boot disk |
+
 ## Quick Start
 
 See [BUILD.md](BUILD.md) for full instructions.
 
 ```bash
-# Install prerequisites
-sudo apt install -y build-essential cmake nvidia-driver-555 cuda-toolkit-12-4
-
 # Phase 0: Simulator (verify logic without real NVMe hardware)
 mkdir build && cd build
-cmake .. -DGPUNVME_USE_SIM=ON && cmake --build . -j$(nproc)
+cmake .. -DGPUNVME_USE_SIM=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-14 \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build . -j$(nproc)
 ctest --output-on-failure
 
-# Phase 1+: Real hardware
+# Real hardware (requires VFIO setup first)
 mkdir ../build-hw && cd ../build-hw
-cmake .. -DGPUNVME_USE_SIM=OFF && cmake --build . -j$(nproc)
-sudo ../scripts/setup_vfio.sh 0000:XX:00.0
-sudo ./check_p2p 0000:XX:00.0       # THE milestone
+cmake .. -DGPUNVME_USE_SIM=OFF \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-14 \
+  -DCMAKE_CUDA_ARCHITECTURES=86
+cmake --build . -j$(nproc)
+sudo ../scripts/setup_vfio.sh 0000:01:00.0
+sudo ./test_single_block 0000:01:00.0
+sudo ./test_layer_loader 0000:01:00.0
 ```
 
 ## Milestones
 
-1. **Phase 0** — GPU reads data through software NVMe simulator
-2. **Phase 1** — GPU reads NVMe Version register via BAR0 MMIO
-3. **Phase 2** — CPU initializes NVMe controller, creates I/O queues
-4. **Phase 3** — GPU reads a block from NVMe autonomously (zero CPU in data path)
-5. **Phase 4** — NVMe DMA writes directly to GPU VRAM (if P2P works)
-6. **Phase 5** — Benchmarks vs cuFile, cpu-memcpy, cpu-pinned
+1. ✅ **Phase 0** — GPU reads data through software NVMe simulator
+2. ✅ **cudaHostRegisterIoMemory** — GPU MMIO to NVMe BAR0 (after nvidia DKMS patch)
+3. ✅ **Single block read** — GPU reads one NVMe block autonomously
+4. ✅ **Multi-block reads** — PRP lists up to MDTS (1024K), 6/6 tests
+5. ✅ **Large sequential reads** — 669 MB @ 2.1 GB/s (SN530), pipeline depth 32
+6. ✅ **Layer Loader API** — `gpunvme_layer_loader_init/load_layer/destroy`
+7. ✅ **SN740 validated** — 8.6 GB @ 3.35 GB/s sustained (96% of Gen3 x4 max)
+8. ✅ **ntransformer integrated** — 70B Q6_K streaming at 0.2 tok/s (33x over mmap)
 
 ## References
 
