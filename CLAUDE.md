@@ -51,7 +51,7 @@ Upgrade a B550/X570 daría Gen4 x4 (~6-7 GB/s) y GPU x16.
 - IOMMU: **OFF** (`amd_iommu=off` en GRUB)
 - Secure Boot: **OFF**
 
-## Estado actual (2026-02-20)
+## Estado actual (2026-02-21)
 
 ### Milestones completados
 
@@ -65,24 +65,44 @@ Upgrade a B550/X570 daría Gen4 x4 (~6-7 GB/s) y GPU x16.
 8. ✅ **Large sequential reads** (669MB @ 2.1 GB/s en SN530, pipeline depth 32)
 9. ✅ **Layer Loader API** (`gpunvme_layer_loader_init/load_layer/destroy`)
 10. ✅ **SN740 validado** (8.6GB @ 3.35 GB/s sustained, 3/3 tests)
+11. ✅ **ntransformer integración** — gpu-nvme-direct como backend de tier C NVMe
 
-### Lo que sigue: ntransformer integration
+### ntransformer integration (COMPLETADO)
 
-El objetivo aplicado es **servir como backend de I/O para ntransformer** (`../ntransformer`),
+gpu-nvme-direct se integró como backend de I/O para ntransformer (`../ntransformer`),
 un inference engine que corre modelos de 70B parámetros en 24GB VRAM via layer streaming
 (SLEP — Streaming Layer Execution Pipeline).
 
-**Pipeline actual de ntransformer (con CPU bottleneck):**
+**Pipeline anterior (con CPU bottleneck):**
 ```
 NVMe → page cache → CPU memcpy → pinned staging → H2D DMA → GPU compute
         (mmap)      (worker thread)   (1.3 GB×2)     (PCIe)
 ```
-Resultado: 0.02 tok/s en 70B. El memcpy del CPU worker thread es el bottleneck.
 
-**Pipeline objetivo (GPU-autónomo, sin CPU en el data path):**
+**Pipeline actual (GPU-autónomo para tier C):**
 ```
-GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
-  (MMIO a BAR0)      (autónomo)   (sin CPU memcpy)    (lee directo)
+GPU doorbell write → NVMe DMA → nvme_read_buf → scatter-copy → staging → H2D → GPU
+  (MMIO a BAR0)      (3.3 GB/s)   (pinned)       (reorder)     (pinned)
+```
+
+**Resultados medidos:**
+- 8B Q8_0: 16 VRAM + 16 NVMe → output idéntico a baseline (temp=0), 1.8 tok/s decode
+- 70B Q6_K: 20 VRAM + 30 RAM + 30 NVMe → output correcto ("Paris"), 0.06 tok/s decode
+- NVMe read: 670 MB/layer @ 3.3 GB/s sostenido (SN740, Gen3 x4)
+
+**Bugs críticos resueltos en la integración:**
+1. **Tensor order mismatch**: GGUF almacena tensores en orden de header (attn_norm→ffn_down→...→attn_q→attn_v),
+   pero el GPU buffer layout espera (attn_q→attn_k→attn_v→attn_output→ffn_gate→ffn_up→ffn_down).
+   Fix: scatter-copy con NvmeTensorMap por tensor.
+2. **Sub-LBA offset**: Los tensores no empiezan en boundaries de 512 bytes.
+   Fix: NVMe read span alineado a LBA, con `read_offset` por tensor.
+
+**Env vars para testing:**
+```bash
+GPUNVME_PCI_BDF=0000:01:00.0   # NVMe PCI address
+GPUNVME_GGUF_LBA=0              # LBA where GGUF starts on raw device
+GPUNVME_MAX_VRAM_LAYERS=N       # Cap tier A (force layers to tier C)
+GPUNVME_MAX_RAM_LAYERS=M        # Cap tier B (force layers to tier C)
 ```
 
 **Roadmap:**
@@ -93,8 +113,8 @@ GPU doorbell write → NVMe DMA → host pinned buffer → GPU compute
 | 2 | Large sequential read | ✅ | 669MB @ 2.1 GB/s (SN530), pipeline depth 32 |
 | 3 | Layer loader API | ✅ | `gpunvme_layer_loader_init/load_layer/destroy` — 3-call reusable API |
 | 4 | SN740 validation | ✅ | 8.6GB @ 3.35 GB/s sustained (PCIe 4.0, MDTS=1024KB) |
-| 5 | ntransformer integración | ⬜ | Reemplazar `LayerStreamer` con gpu-nvme-direct backend |
-| 6 | Port ntransformer a Linux | ⬜ | Actualmente solo testeado en Windows/MSVC |
+| 5 | ntransformer integración | ✅ | Tier C NVMe backend con scatter-copy (8B y 70B verificados) |
+| 6 | Port ntransformer a Linux | ✅ | Completado previamente |
 
 ### Throughput medido (gpu-nvme-direct Layer Loader)
 
@@ -111,19 +131,20 @@ Con B550/X570 (Gen4 real), SN740 daría ~6-7 GB/s.
 
 | Ruta de datos | BW medido/estimado | 1 layer (669MB) | 80 layers | tok/s |
 |---------------|-------------------|-----------------|-----------|-------|
-| mmap+memcpy+H2D (actual ntransformer) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
-| **gpu-nvme-direct (SN740, B450 Gen3)** | **3.35 GB/s medido** | **~200ms** | **~16s** | **0.06** |
-| gpu-nvme-direct (SN530, Gen3) | 2.1 GB/s medido | 315ms | 25s | 0.04 |
+| mmap+memcpy+H2D (original) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
+| 3-tier VRAM+RAM (29+51+0) | ~6.5 GB/s (H2D) | ~100ms | 5.3s | 0.2 |
+| **gpu-nvme-direct (20V+30R+30N)** | **3.3 GB/s NVMe** | **~203ms** | **~16s** | **0.06 medido** |
 | **gpu-nvme-direct (SN740 + B550 Gen4)** | **~6-7 GB/s estimado** | **~100ms** | **~8s** | **0.12** |
-| Tier 1 + compute overlap | ~3.0-3.4 GB/s | ~200ms oculto | ~16s | 0.06 |
 | Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
 
-La ganancia real es **eliminar el CPU del data path** y el memcpy sincrónico.
-Para Q8_0 (70B = ~70GB, no cabe en 48GB RAM): el streaming desde NVMe es obligatorio.
+La ganancia real del NVMe path es para modelos que **no caben en RAM** (70B Q8_0 = 70GB > 48GB RAM).
+Para 70B Q6_K (56GB): 20 VRAM + 30 RAM + 30 NVMe = 0.06 tok/s medido (vs 0.02 con mmap baseline).
 
-### GGUF de prueba en NVMe
-- **llama-3.1-8b-instruct-q8_0.gguf** (8.5GB) escrito en SN740 con `dd` a LBA 0
-- Usado para validar Layer Loader: 3/3 tests pass, 8614 MB @ 3350 MB/s
+### GGUF en NVMe (SN740 = /dev/nvme1n1)
+- **llama-3.1-70b-instruct-q6_k.gguf** (56GB) escrito con `dd` a LBA 0
+- Previamente: llama-3.1-8b-instruct-q8_0.gguf (8.5GB) — reemplazado por 70B
+- Validado: ntransformer 70B con 30 layers NVMe, output correcto
+- **NOTA**: SN740 es `/dev/nvme1n1` (NO nvme0n1, que es el boot SN530)
 
 ## Estructura del proyecto
 
@@ -273,7 +294,7 @@ pero no se necesitan para Tier 1.
 8. ✅ **Large sequential reads**: 669MB @ 2.1 GB/s (SN530), pipeline depth 32
 9. ✅ **Layer Loader API**: 3-call reusable interface (`init/load_layer/destroy`)
 10. ✅ **SN740 validated**: 8.6GB @ 3.35 GB/s sustained (PCIe 4.0, MDTS=1024KB)
-11. ⬜ ntransformer integración (reemplazar LayerStreamer)
+11. ✅ **ntransformer integración**: tier C NVMe backend, 8B+70B verificados @ 3.3 GB/s
 
 ## Referencia rápida NVMe
 
