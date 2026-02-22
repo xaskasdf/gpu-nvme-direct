@@ -133,12 +133,15 @@ With B550/X570 (real Gen4), SN740 would deliver ~6-7 GB/s.
 | mmap+memcpy+H2D (original) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
 | 3-tier VRAM+RAM (29+51+0) | ~6.5 GB/s (H2D) | ~100ms | 5.3s | 0.2 |
 | gpu-nvme-direct Tier 1 (20V+30R+30N) | 3.3 GB/s NVMe | ~203ms | ~16s | 0.06 |
-| **gpu-nvme-direct BAR1 (20V+30R+30N)** | **3.3 GB/s BAR1→VRAM** | **~201ms** | **~9.5s** | **0.10 measured** |
-| **gpu-nvme-direct (SN740 + B550 Gen4)** | **~6-7 GB/s estimated** | **~100ms** | **~8s** | **0.12** |
+| **gpu-nvme-direct BAR1 sync (20V+30R+30N)** | **3.3 GB/s BAR1→VRAM** | **~201ms** | **~9.5s** | **0.10 measured** |
+| **gpu-nvme-direct BAR1 async (20V+30R+30N)** | **3.3 GB/s BAR1→VRAM** | **~201ms** | **~9.1s** | **0.11 measured** |
+| **BAR1 async + layer skip 0.98** | **3.3 GB/s BAR1→VRAM** | **~201ms** | **~5s** | **0.20 measured** |
+| gpu-nvme-direct (SN740 + B550 Gen4) | ~6-7 GB/s estimated | ~100ms | ~8s | 0.12 |
 | Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
 
 The real benefit of the NVMe path is for models that **do not fit in RAM** (70B Q8_0 = 70GB > 48GB RAM).
-For 70B Q6_K (56GB): 20 VRAM + 30 RAM + 30 NVMe = 0.10 tok/s measured with BAR1 (vs 0.06 Tier 1, 0.02 mmap baseline).
+For 70B Q6_K (56GB): 20 VRAM + 30 RAM + 30 NVMe = 0.11 tok/s (BAR1 async), 0.20 tok/s with layer skip.
+SSD thermal throttling after ~53s sustained 3.3 GB/s causes ~56% slower reads in bursts (no software fix).
 
 ### GGUF on NVMe (SN740 = /dev/nvme1n1)
 - **llama-3.1-70b-instruct-q6_k.gguf** (56GB) written with `dd` to LBA 0
@@ -394,3 +397,5 @@ Replace ntransformer's streaming backend with gpu-nvme-direct:
 | I/O SQ/CQ not page-aligned | cudaMallocHost suballocator (after many allocs) | posix_memalign + mlock + cudaHostRegister |
 | PRP lists not page-aligned | Same suballocator issue | Pool allocation with posix_memalign |
 | BAR1 Tier 2 always falls back to Tier 1 | GGUF tensors have sub-LBA offsets (GGML_MEM_ALIGN=32, NVMe block=512) | Bulk read entire LBA span to VRAM temp, D2D scatter to gpu_buf_ |
+| Async NVMe deadlock (begin_h2d hangs) | BAR1 wait path in begin_h2d triggered for RAM layers too (staging_ready never set) | Guard with `layer_tier_[layer_idx] == LayerTier::NVME` |
+| ~314ms NVMe reads (56% slower bursts) | SSD thermal throttling after ~53s sustained 3.3 GB/s (SN740 M.2 2230, no heatsink) | Hardware only: add heatsink or upgrade to Gen4 board |
