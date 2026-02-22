@@ -140,6 +140,7 @@ gpunvme_err_t gpunvme_layer_loader_init(gpunvme_layer_loader_t *loader,
     memset(loader, 0, sizeof(*loader));
     loader->bar0_fd = -1;
     loader->pagemap_fd = -1;
+    loader->bar1_fd = -1;
 
     /* Map BAR0 */
     char path[256];
@@ -380,6 +381,278 @@ gpunvme_err_t gpunvme_load_layer(gpunvme_layer_loader_t *loader,
     return GPUNVME_OK;
 }
 
+/* ---- BAR1 direct VRAM support (Tier 2) ---- */
+
+/* GPU kernel: write a unique pattern to VRAM for BAR1 offset discovery */
+__global__
+void bar1_fill_pattern(uint64_t *addr, uint64_t pattern, int count) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < count) addr[i] = pattern;
+}
+
+/* Parse GPU BAR1 physical base from /sys/bus/pci/devices/.../resource */
+static uint64_t parse_bar1_phys(const char *gpu_bdf) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource", gpu_bdf);
+
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    /* resource file: one line per BAR, format "start end flags"
+     * Line 0 = BAR0, Line 1 = BAR1 (64-bit spans lines 1-2) */
+    char line[256];
+    int lineno = 0;
+    uint64_t bar1_start = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (lineno == 1) {
+            /* BAR1 line: "0x7000000000 0x77ffffffff 0x000000000014220c" */
+            unsigned long long start, end, flags;
+            if (sscanf(line, "0x%llx 0x%llx 0x%llx", &start, &end, &flags) >= 2) {
+                bar1_start = (uint64_t)start;
+            }
+            break;
+        }
+        lineno++;
+    }
+    fclose(f);
+    return bar1_start;
+}
+
+gpunvme_err_t gpunvme_bar1_init(gpunvme_layer_loader_t *loader,
+                                 const char *gpu_bdf,
+                                 uint64_t static_bar1_offset) {
+    if (!loader || !gpu_bdf)
+        return GPUNVME_ERR_INVALID_PARAM;
+
+    /* Read GPU BAR1 physical base from PCI config */
+    uint64_t bar1_phys = parse_bar1_phys(gpu_bdf);
+    if (bar1_phys == 0) {
+        fprintf(stderr, "bar1_init: failed to read BAR1 from %s\n", gpu_bdf);
+        return GPUNVME_ERR_BAR_MAP;
+    }
+
+    /* Open GPU resource1_wc for pattern scanning */
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource1_wc", gpu_bdf);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        /* Fallback to non-WC */
+        snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource1", gpu_bdf);
+        fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "bar1_init: failed to open %s\n", path);
+            return GPUNVME_ERR_BAR_MAP;
+        }
+    }
+
+    loader->bar1_fd = fd;
+    loader->gpu_bar1_phys = bar1_phys;
+    loader->bar1_vram_offset = static_bar1_offset;
+    loader->bar1_enabled = 1;
+
+    fprintf(stderr, "bar1_init: GPU BAR1 phys=0x%llx, VRAM starts at BAR1+0x%llx\n",
+            (unsigned long long)bar1_phys,
+            (unsigned long long)static_bar1_offset);
+
+    return GPUNVME_OK;
+}
+
+gpunvme_err_t gpunvme_bar1_resolve(gpunvme_layer_loader_t *loader,
+                                    void *vram_ptr,
+                                    size_t vram_size,
+                                    uint64_t *bar1_phys_out) {
+    if (!loader || !loader->bar1_enabled || !vram_ptr || !bar1_phys_out)
+        return GPUNVME_ERR_INVALID_PARAM;
+
+    /* Step 1: Write unique pattern to first 64 bytes of VRAM buffer */
+    uint64_t pattern = 0xBA01CAFE00000000ULL | (uint64_t)((uintptr_t)vram_ptr & 0xFFFFFFFF);
+    int nwords = 8;  /* 64 bytes = 8 x uint64_t */
+    bar1_fill_pattern<<<1, nwords>>>((uint64_t *)vram_ptr, pattern, nwords);
+    cudaDeviceSynchronize();
+
+    /* Step 2: Fast stride scan — probe first 8 bytes of each 2MB GPU page.
+     * cudaMalloc returns 2MB-aligned addresses on Ampere, so the pattern
+     * lands at the start of a 2MB BAR1 page. This reduces the scan from
+     * reading every byte (minutes) to 12288 probes (~12ms for 24GB VRAM). */
+    uint64_t scan_start = loader->bar1_vram_offset;
+    uint64_t scan_end = scan_start + 24ULL * 1024 * 1024 * 1024;  /* 24GB VRAM */
+    size_t stride = 2 * 1024 * 1024;  /* 2MB GPU page size */
+    size_t page_size = sysconf(_SC_PAGESIZE);  /* 4KB for mmap alignment */
+    uint64_t found_offset = 0;
+    int found = 0;
+
+    /* Mmap a sliding window (256MB) for efficient scanning */
+    size_t window_size = 256ULL * 1024 * 1024;
+
+    for (uint64_t win_start = scan_start; win_start < scan_end && !found; win_start += window_size) {
+        size_t map_size = window_size;
+        if (win_start + map_size > scan_end) map_size = scan_end - win_start;
+
+        void *map = mmap(NULL, map_size, PROT_READ, MAP_SHARED,
+                         loader->bar1_fd, win_start);
+        if (map == MAP_FAILED) continue;
+
+        /* Probe first 8 bytes at each 2MB stride within this window */
+        for (size_t off = 0; off < map_size && !found; off += stride) {
+            volatile uint64_t *p = (volatile uint64_t *)((uint8_t *)map + off);
+            if (*p == pattern) {
+                /* Verify consecutive words */
+                int consecutive = 0;
+                for (int j = 0; j < nwords; j++) {
+                    if (p[j] == pattern) consecutive++;
+                }
+                if (consecutive >= 4) {
+                    found_offset = win_start + off;
+                    found = 1;
+                }
+            }
+        }
+        munmap(map, map_size);
+    }
+
+    if (!found) {
+        fprintf(stderr, "bar1_resolve: pattern not found in BAR1 — static BAR1 not enabled?\n");
+        return GPUNVME_ERR_DMA;
+    }
+
+    uint64_t bar1_phys = loader->gpu_bar1_phys + found_offset;
+    fprintf(stderr, "bar1_resolve: VRAM ptr=%p → BAR1 offset=0x%llx → phys=0x%llx\n",
+            vram_ptr,
+            (unsigned long long)found_offset,
+            (unsigned long long)bar1_phys);
+
+    /* Step 3: Verify contiguity at midpoint of allocation */
+    if (vram_size >= 2 * stride) {
+        size_t check_offset = (vram_size / 2) & ~(size_t)(stride - 1);  /* 2MB-aligned */
+        uint64_t pattern2 = pattern ^ 0xFFFFFFFFULL;
+        uint64_t *check_ptr = (uint64_t *)((uint8_t *)vram_ptr + check_offset);
+        bar1_fill_pattern<<<1, nwords>>>(check_ptr, pattern2, nwords);
+        cudaDeviceSynchronize();
+
+        uint64_t expected_bar1_off = found_offset + check_offset;
+        void *map = mmap(NULL, page_size, PROT_READ, MAP_SHARED,
+                         loader->bar1_fd, expected_bar1_off);
+        if (map != MAP_FAILED) {
+            volatile uint64_t *p = (volatile uint64_t *)map;
+            if (p[0] == pattern2) {
+                fprintf(stderr, "bar1_resolve: contiguity verified at +0x%zx\n", check_offset);
+            } else {
+                fprintf(stderr, "bar1_resolve: WARNING — VRAM not contiguous at +0x%zx "
+                        "(expected 0x%llx, got 0x%llx)\n",
+                        check_offset,
+                        (unsigned long long)pattern2,
+                        (unsigned long long)p[0]);
+                munmap(map, page_size);
+                return GPUNVME_ERR_DMA;
+            }
+            munmap(map, page_size);
+        }
+    }
+
+    *bar1_phys_out = bar1_phys;
+    return GPUNVME_OK;
+}
+
+gpunvme_err_t gpunvme_load_layer_vram(gpunvme_layer_loader_t *loader,
+                                       uint64_t start_lba,
+                                       size_t size_bytes,
+                                       uint64_t dest_bar1_phys) {
+    if (!loader || !loader->bar1_enabled || size_bytes == 0)
+        return GPUNVME_ERR_INVALID_PARAM;
+
+    uint32_t block_size = loader->ctrl.block_size;
+    uint32_t page_size = loader->ctrl.page_size;
+    uint32_t total_blocks = (uint32_t)((size_bytes + block_size - 1) / block_size);
+    uint32_t n_commands = (total_blocks + loader->blocks_per_cmd - 1) / loader->blocks_per_cmd;
+
+    if (n_commands > loader->max_commands) {
+        fprintf(stderr, "load_layer_vram: size %zu requires %u commands, max is %u\n",
+                size_bytes, n_commands, loader->max_commands);
+        return GPUNVME_ERR_INVALID_PARAM;
+    }
+
+    /* Build PRP entries using BAR1 physical addresses.
+     * Unlike pagemap, we compute addresses directly:
+     * dest_bar1_phys + offset = physical address visible on PCIe bus */
+    int pm_fd = loader->pagemap_fd;
+
+    for (uint32_t i = 0; i < n_commands; i++) {
+        uint32_t remaining_blocks = total_blocks - i * loader->blocks_per_cmd;
+        uint32_t cmd_blocks = (remaining_blocks < loader->blocks_per_cmd)
+                              ? remaining_blocks : loader->blocks_per_cmd;
+        uint32_t cmd_bytes = cmd_blocks * block_size;
+        uint32_t cmd_pages = (cmd_bytes + page_size - 1) / page_size;
+
+        /* This command's PRP list page (still in host pinned memory) */
+        uint64_t *list_virt = (uint64_t *)((uint8_t *)loader->prp_pool + (size_t)i * 4096);
+        uint64_t list_phys = virt_to_phys_pagemap(pm_fd, list_virt);
+
+        /* Compute BAR1 physical address for each data page */
+        uint64_t chunk_phys = dest_bar1_phys + (uint64_t)i * loader->ctrl.max_transfer_bytes;
+        uint64_t prp1 = 0, prp2 = 0;
+
+        for (uint32_t p = 0; p < cmd_pages; p++) {
+            uint64_t phys = chunk_phys + (uint64_t)p * page_size;
+
+            if (p == 0) {
+                prp1 = phys;
+            } else {
+                list_virt[p - 1] = phys;
+            }
+        }
+
+        if (cmd_pages <= 1) {
+            prp2 = 0;
+        } else if (cmd_pages == 2) {
+            prp2 = list_virt[0];
+        } else {
+            prp2 = list_phys;
+        }
+
+        loader->prp1_array[i] = prp1;
+        loader->prp2_array[i] = prp2;
+    }
+
+    /* Fill kernel params and launch (same GPU kernel as Tier 1) */
+    layer_read_params *params = (layer_read_params *)loader->kernel_params;
+    layer_read_result *result = (layer_read_result *)loader->kernel_result;
+
+    params->start_lba = start_lba;
+    params->total_blocks = total_blocks;
+    params->blocks_per_cmd = loader->blocks_per_cmd;
+    params->n_commands = n_commands;
+    params->pipeline_depth = loader->pipeline_depth;
+    params->prp1_array = loader->prp1_array;
+    params->prp2_array = loader->prp2_array;
+    memset(result, 0, sizeof(layer_read_result));
+
+    gpu_layer_read<<<1, 1>>>(loader->ioq.gpu_queue, params, result);
+    cudaError_t cerr = cudaDeviceSynchronize();
+
+    if (cerr != cudaSuccess) {
+        fprintf(stderr, "load_layer_vram: GPU kernel error: %s\n", cudaGetErrorString(cerr));
+        return GPUNVME_ERR_CUDA;
+    }
+
+    if (result->status != 0) {
+        fprintf(stderr, "load_layer_vram: read failed at command %u/%u: error=%u, cqe_status=0x%04x\n",
+                result->commands_completed, n_commands,
+                result->error_code, result->cqe_status);
+        if (result->error_code == 2)
+            return GPUNVME_ERR_TIMEOUT;
+        return GPUNVME_ERR_NVME_STATUS;
+    }
+
+    if (loader->gpu_clock_khz > 0 && result->gpu_cycles > 0) {
+        double seconds = (double)result->gpu_cycles / ((double)loader->gpu_clock_khz * 1000.0);
+        double mb_per_sec = (double)size_bytes / (1024.0 * 1024.0) / seconds;
+        fprintf(stderr, "load_layer_vram: %zu bytes (%u cmds) in %.1f ms — %.1f MB/s [BAR1→VRAM]\n",
+                size_bytes, n_commands, seconds * 1000.0, mb_per_sec);
+    }
+
+    return GPUNVME_OK;
+}
+
 uint32_t gpunvme_layer_loader_block_size(const gpunvme_layer_loader_t *loader) {
     return loader ? loader->ctrl.block_size : 0;
 }
@@ -415,6 +688,12 @@ void gpunvme_layer_loader_destroy(gpunvme_layer_loader_t *loader) {
     gpunvme_delete_io_queue(&loader->ctrl, &loader->ioq);
     gpunvme_ctrl_shutdown(&loader->ctrl);
 
+    if (loader->bar1_fd >= 0) {
+        close(loader->bar1_fd);
+        loader->bar1_fd = -1;
+    }
+    loader->bar1_enabled = 0;
+
     if (loader->bar0) {
         cudaHostUnregister((void *)loader->bar0);
         munmap((void *)loader->bar0, loader->bar0_size);
@@ -428,4 +707,5 @@ void gpunvme_layer_loader_destroy(gpunvme_layer_loader_t *loader) {
     memset(loader, 0, sizeof(*loader));
     loader->bar0_fd = -1;
     loader->pagemap_fd = -1;
+    loader->bar1_fd = -1;
 }

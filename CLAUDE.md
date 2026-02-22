@@ -364,7 +364,7 @@ Replace ntransformer's streaming backend with gpu-nvme-direct:
 - **Warp-cooperative submission**: An entire warp collaborates on SQ entries
 - **Write support**: Writes follow the same logic
 - **Filesystem-aware reads**: Parse metadata from the GPU
-- **Tier 2**: NVMe DMA direct to GPU VRAM (requires patched nvidia_p2p)
+- ~~**Tier 2**: NVMe DMA direct to GPU VRAM~~ — **DONE** via BAR1 bypass (4.2 GB/s)
 
 ## Code conventions
 

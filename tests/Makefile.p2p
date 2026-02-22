@@ -1,0 +1,13 @@
+obj-m := test_p2p.o
+test_p2p-objs := test_p2p_kmod.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+NV_SRC := /usr/src/nvidia-590.48.01/nvidia
+
+ccflags-y += -I$(NV_SRC) -DHAVE_NV_P2P_H=1 -include $(NV_SRC)/nv-p2p.h
+
+all:
+	make -C $(KDIR) M=$(PWD) modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) clean

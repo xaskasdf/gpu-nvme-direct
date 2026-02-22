@@ -168,6 +168,13 @@ if(NOT GPUNVME_USE_SIM)
     target_link_libraries(test_layer_loader PRIVATE
         gpunvme_layer_loader gpunvme_host gpunvme_device CUDA::cudart stdc++ m)
     add_test(NAME test_layer_loader COMMAND test_layer_loader)
+
+    add_executable(test_bar1_dma tests/test_bar1_dma.cu)
+    target_include_directories(test_bar1_dma PRIVATE
+        ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_bar1_dma PRIVATE
+        gpunvme_layer_loader gpunvme_host gpunvme_device CUDA::cudart stdc++ m)
+    add_test(NAME test_bar1_dma COMMAND test_bar1_dma)
 endif()
 
 # ---------- Tools (Phase 1+) ----------
