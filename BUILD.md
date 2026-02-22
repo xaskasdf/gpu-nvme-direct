@@ -2,32 +2,32 @@
 
 ## Hardware
 
-| Componente | Detalle |
+| Component | Detail |
 |---|---|
 | GPU | NVIDIA RTX 3090 (sm_86) |
 | CPU | AMD Ryzen 7 5800X |
-| OS | Ubuntu 24.04 LTS (bare metal, instalado en NVMe) |
-| NVMe test | PCIe 4.0 (SSD dedicado para testing, **NO** el boot) |
+| OS | Ubuntu 24.04 LTS (bare metal, installed on NVMe) |
+| NVMe test | PCIe 4.0 (dedicated SSD for testing, **NOT** the boot drive) |
 | CUDA | 12.4 |
 
 ---
 
-## Paso 0: Instalar Ubuntu y dependencias
+## Step 0: Install Ubuntu and dependencies
 
-### BIOS (configurar antes de instalar)
+### BIOS (configure before installing)
 
-- **Above 4G Decoding**: ON (necesario para mapear BAR0)
-- **IOMMU**: OFF (o agregar `amd_iommu=off` a GRUB después)
-- **Secure Boot**: OFF (para el kernel module custom)
+- **Above 4G Decoding**: ON (required for BAR0 mapping)
+- **IOMMU**: OFF (or add `amd_iommu=off` to GRUB later)
+- **Secure Boot**: OFF (for the custom kernel module)
 
-### Instalar Ubuntu
+### Install Ubuntu
 
-1. Descargar [Ubuntu 24.04 LTS](https://ubuntu.com/download/desktop)
-2. Grabar en USB con [Rufus](https://rufus.ie) o [Ventoy](https://ventoy.net)
-3. Instalar en la NVMe nueva (NO en el disco de Windows)
-4. Verificar que arranca correctamente con dual-boot
+1. Download [Ubuntu 24.04 LTS](https://ubuntu.com/download/desktop)
+2. Flash to USB with [Rufus](https://rufus.ie) or [Ventoy](https://ventoy.net)
+3. Install on the new NVMe (NOT on the Windows disk)
+4. Verify it boots correctly with dual-boot
 
-### Instalar dependencias
+### Install dependencies
 
 ```bash
 # Build essentials
@@ -35,31 +35,31 @@ sudo apt update
 sudo apt install -y build-essential cmake git
 
 # NVIDIA driver + CUDA toolkit
-# Opción 1: Desde repos de Ubuntu (más simple)
+# Option 1: From Ubuntu repos (simpler)
 sudo apt install -y nvidia-driver-555
 
-# Opción 2: Desde repos de NVIDIA (más control sobre la versión)
+# Option 2: From NVIDIA repos (more control over the version)
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
 
-# Instalar CUDA toolkit (nvcc, headers, libs)
+# Install CUDA toolkit (nvcc, headers, libs)
 sudo apt install -y cuda-toolkit-12-4
 
-# Agregar al PATH
+# Add to PATH
 echo 'export PATH=/usr/local/cuda-12.4/bin:$PATH' >> ~/.bashrc
 echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
 source ~/.bashrc
 
-# Verificar
-nvcc --version       # debe decir 12.4
-nvidia-smi           # debe mostrar RTX 3090
+# Verify
+nvcc --version       # should say 12.4
+nvidia-smi           # should show RTX 3090
 
-# Para benchmarks (opcional)
+# For benchmarks (optional)
 sudo apt install -y python3 python3-pip python3-matplotlib python3-numpy
 ```
 
-### Si cmake < 3.22
+### If cmake < 3.22
 
 ```bash
 wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null \
@@ -71,26 +71,26 @@ sudo apt update && sudo apt install -y cmake
 
 ---
 
-## Paso 1: Build Phase 0 (Simulador)
+## Step 1: Build Phase 0 (Simulator)
 
-Compila y testea la lógica NVMe completa usando un simulador en software.
-No necesita hardware NVMe real. Sirve para verificar que el código GPU funciona.
+Compiles and tests the full NVMe logic using a software simulator.
+No real NVMe hardware needed. Useful for verifying that the GPU code works.
 
 ```bash
 cd ~/gpu-nvme-direct
 mkdir -p build && cd build
 
-# Configurar con simulador habilitado
+# Configure with simulator enabled
 cmake .. -DCMAKE_BUILD_TYPE=Debug -DGPUNVME_USE_SIM=ON
 
-# Compilar
+# Build
 cmake --build . -j$(nproc)
 
-# Correr tests
+# Run tests
 ctest --output-on-failure
 ```
 
-### Qué esperar
+### What to expect
 
 ```
 === NVMe Struct Tests ===
@@ -115,69 +115,69 @@ Using GPU: NVIDIA GeForce RTX 3090 (SM 8.6)
 === Results: 3/3 passed ===
 ```
 
-Si ambos pasan, la lógica del GPU kernel (SQ submit -> doorbell -> CQ poll) funciona.
+If both pass, the GPU kernel logic (SQ submit -> doorbell -> CQ poll) works.
 
 ---
 
-## Paso 2: Identificar y preparar la NVMe de test
+## Step 2: Identify and prepare the test NVMe
 
 ```bash
-# 1. Verificar prerequisitos del sistema
+# 1. Verify system prerequisites
 sudo ./scripts/check_prereqs.sh
 
-# 2. Identificar la NVMe de test (anotar el BDF, ej: 0000:03:00.0)
+# 2. Identify the test NVMe (note the BDF, e.g.: 0000:03:00.0)
 lspci -nn | grep NVMe
 
-# 3. VERIFICAR que NO es el boot drive
+# 3. VERIFY that it is NOT the boot drive
 findmnt /
-# Si dice /dev/nvme0n1p2, tu boot está en nvme0.
-# La NVMe de test debería ser nvme1 o similar.
-# NUNCA usar el boot drive.
+# If it says /dev/nvme0n1p2, your boot is on nvme0.
+# The test NVMe should be nvme1 or similar.
+# NEVER use the boot drive.
 
-# 4. Capturar baseline para verificación posterior
+# 4. Capture baseline for later verification
 sudo dd if=/dev/nvmeXn1 bs=512 count=1 of=/tmp/baseline.bin
 
-# 5. Verificar topología PCIe (GPU y NVMe en el mismo root complex = mejor)
+# 5. Verify PCIe topology (GPU and NVMe on the same root complex = best)
 sudo ./tools/pcie_topology.sh
 
-# 6. Unbind del kernel y bind a vfio-pci
-sudo ./scripts/setup_vfio.sh 0000:XX:00.0   # <-- tu BDF
+# 6. Unbind from the kernel and bind to vfio-pci
+sudo ./scripts/setup_vfio.sh 0000:XX:00.0   # <-- your BDF
 ```
 
 ---
 
-## Paso 3: Build Phase 1+ (Hardware real)
+## Step 3: Build Phase 1+ (Real hardware)
 
 ```bash
 cd ~/gpu-nvme-direct
 mkdir -p build-hw && cd build-hw
 
-# Configurar SIN simulador
+# Configure WITHOUT simulator
 cmake .. -DCMAKE_BUILD_TYPE=Release -DGPUNVME_USE_SIM=OFF
 
-# Compilar
+# Build
 cmake --build . -j$(nproc)
 ```
 
 ---
 
-## Paso 4: Tests de hardware
+## Step 4: Hardware tests
 
-### Test 1: Dump de registros BAR0 (CPU-side)
+### Test 1: BAR0 register dump (CPU-side)
 
 ```bash
 sudo ./build-hw/dump_bar0 0000:XX:00.0
 ```
 
-Debe imprimir: CAP, VS (versión NVMe), CC, CSTS, etc.
+Should print: CAP, VS (NVMe version), CC, CSTS, etc.
 
-### Test 2: GPU lee registro NVMe via MMIO (MILESTONE 1)
+### Test 2: GPU reads NVMe register via MMIO (MILESTONE 1)
 
 ```bash
 sudo ./build-hw/check_p2p 0000:XX:00.0
 ```
 
-Si `cudaHostRegisterIoMemory` **funciona**:
+If `cudaHostRegisterIoMemory` **succeeds**:
 
 ```
 RESULT: cudaHostRegisterIoMemory SUCCEEDED!
@@ -185,55 +185,55 @@ GPU read NVMe Version: 1.4.0 (raw: 0x00010400)
 RESULT: *** SUCCESS *** GPU and CPU read matching Version registers!
 ```
 
-Si **falla** (probable en GeForce):
+If it **fails** (likely on GeForce):
 
 ```
 RESULT: cudaHostRegisterIoMemory FAILED: invalid argument
 ```
 
-Esto es un resultado de investigación válido. Documentarlo.
+This is a valid research result. Document it.
 
-### Test 3: Lectura BAR0 completa desde GPU
+### Test 3: Full BAR0 read from GPU
 
 ```bash
 sudo ./build-hw/test_bar_read 0000:XX:00.0
 ```
 
-Compara 5 registros leídos por CPU vs GPU. Todos deben coincidir.
+Compares 5 registers read by CPU vs GPU. All should match.
 
-### Test 4: GPU lee un bloque del NVMe (MILESTONE 2 — EL GRANDE)
+### Test 4: GPU reads a block from NVMe (MILESTONE 2 — THE BIG ONE)
 
 ```bash
 sudo ./build-hw/test_single_block 0000:XX:00.0 /tmp/baseline.bin
 ```
 
-Si dice `*** MILESTONE: Data matches baseline! ***` -> **GPU leyó un bloque
-del NVMe de forma autónoma, sin CPU en el data path.**
+If it says `*** MILESTONE: Data matches baseline! ***` -> **GPU read a block
+from the NVMe autonomously, without CPU in the data path.**
 
 ---
 
-## Paso 5: Benchmarks
+## Step 5: Benchmarks
 
 ```bash
 cd build-hw/bench
 
-# Benchmark GPU-direct
+# GPU-direct benchmark
 ./bench_gpu_direct --block-size 4K --num-ops 1000 --output results_gpu.csv
 
-# Baselines CPU
+# CPU baselines
 ./bench_cpu_memcpy --device /dev/nvmeXn1 --block-size 4K --num-ops 1000
 ./bench_cpu_pinned --device /dev/nvmeXn1 --block-size 4K --num-ops 1000
 
-# Sweep completo (~30 min)
+# Full sweep (~30 min)
 python3 bench_sweep.py --device /dev/nvmeXn1
 
-# Generar plots
+# Generate plots
 python3 plot_results.py aggregate_results.csv
 ```
 
 ---
 
-## Paso 6: Kernel module (si Phase 1 funciona)
+## Step 6: Kernel module (if Phase 1 works)
 
 ```bash
 # Build
@@ -243,25 +243,25 @@ make
 # Load
 sudo ../scripts/setup_kmod.sh 0000:XX:00.0
 
-# Verificar
+# Verify
 ls -la /dev/gpunvme0
 dmesg | tail -20
 ```
 
 ---
 
-## Resumen de comandos rápidos
+## Quick command reference
 
 ```bash
-# === SIMULADOR (verificar lógica) ===
+# === SIMULATOR (verify logic) ===
 cd ~/gpu-nvme-direct && mkdir build && cd build
 cmake .. -DGPUNVME_USE_SIM=ON && cmake --build . -j$(nproc) && ctest
 
-# === HARDWARE REAL ===
+# === REAL HARDWARE ===
 cd ~/gpu-nvme-direct && mkdir build-hw && cd build-hw
 cmake .. -DGPUNVME_USE_SIM=OFF && cmake --build . -j$(nproc)
 
-# Setup NVMe:
+# NVMe setup:
 sudo ../scripts/check_prereqs.sh
 sudo ../scripts/setup_vfio.sh 0000:XX:00.0
 
@@ -270,7 +270,7 @@ sudo ./check_p2p 0000:XX:00.0
 sudo ./test_bar_read 0000:XX:00.0
 sudo ./test_single_block 0000:XX:00.0 /tmp/baseline.bin
 
-# Cuando termines, devolver NVMe al kernel:
+# When done, return NVMe to kernel:
 sudo ../scripts/teardown.sh 0000:XX:00.0
 ```
 
@@ -278,14 +278,14 @@ sudo ../scripts/teardown.sh 0000:XX:00.0
 
 ## Troubleshooting
 
-| Problema | Solución |
+| Problem | Solution |
 |---|---|
-| `nvcc: command not found` | Instalar cuda-toolkit-12-4, verificar PATH |
-| `cmake version too old` | Actualizar cmake desde Kitware PPA |
-| `cudaHostRegisterIoMemory: invalid argument` | Esperado en GeForce. Intentar con NVIDIA open-source kernel modules |
-| `No CUDA devices found` | Verificar `nvidia-smi`. Reinstalar driver si no funciona |
-| `test_sim_basic` timeout | Aumentar timeout en `gpu_nvme_queue.poll_timeout_cycles` |
-| `resource0: Permission denied` | Necesitas `sudo` + device bound a vfio-pci |
-| `CSTS.CFS = 1` (fatal) | Controller crasheó. Rebind con `teardown.sh`, reboot si es necesario |
-| NVMe no aparece después de unbind | `sudo ../scripts/teardown.sh`, luego re-setup |
-| `vfio-pci: probe failed` | Verificar que IOMMU está OFF en GRUB |
+| `nvcc: command not found` | Install cuda-toolkit-12-4, verify PATH |
+| `cmake version too old` | Update cmake from Kitware PPA |
+| `cudaHostRegisterIoMemory: invalid argument` | Expected on GeForce. Try with NVIDIA open-source kernel modules |
+| `No CUDA devices found` | Verify `nvidia-smi`. Reinstall driver if it doesn't work |
+| `test_sim_basic` timeout | Increase timeout in `gpu_nvme_queue.poll_timeout_cycles` |
+| `resource0: Permission denied` | You need `sudo` + device bound to vfio-pci |
+| `CSTS.CFS = 1` (fatal) | Controller crashed. Rebind with `teardown.sh`, reboot if necessary |
+| NVMe doesn't appear after unbind | `sudo ../scripts/teardown.sh`, then re-setup |
+| `vfio-pci: probe failed` | Verify that IOMMU is OFF in GRUB |
