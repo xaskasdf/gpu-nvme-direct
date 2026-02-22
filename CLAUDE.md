@@ -78,16 +78,16 @@ NVMe → page cache → CPU memcpy → pinned staging → H2D DMA → GPU comput
         (mmap)      (worker thread)   (1.3 GB×2)     (PCIe)
 ```
 
-**Current pipeline (GPU-autonomous for tier C):**
+**Current pipeline (BAR1 Tier 2 — NVMe DMA direct to VRAM):**
 ```
-GPU doorbell write → NVMe DMA → nvme_read_buf → scatter-copy → staging → H2D → GPU
-  (MMIO to BAR0)     (3.3 GB/s)   (pinned)       (reorder)     (pinned)
+GPU doorbell write → NVMe DMA → nvme_vram_temp_ (VRAM via BAR1) → D2D scatter → gpu_buf_[slot]
+  (MMIO to BAR0)     (3.3 GB/s)   (1 bulk read)                    (7 × memcpy)
 ```
 
 **Measured results:**
 - 8B Q8_0: 16 VRAM + 16 NVMe → output identical to baseline (temp=0), 1.8 tok/s decode
-- 70B Q6_K: 20 VRAM + 30 RAM + 30 NVMe → correct output ("Paris"), 0.06 tok/s decode
-- NVMe read: 670 MB/layer @ 3.3 GB/s sustained (SN740, Gen3 x4)
+- 70B Q6_K: 20 VRAM + 30 RAM + 30 NVMe → correct output ("Paris"), 0.10 tok/s decode
+- NVMe read: 670 MB/layer @ 3.3 GB/s sustained via BAR1 (SN740, Gen3 x4)
 
 **Critical bugs resolved during integration:**
 1. **Tensor order mismatch**: GGUF stores tensors in header order (attn_norm→ffn_down→...→attn_q→attn_v),
@@ -132,12 +132,13 @@ With B550/X570 (real Gen4), SN740 would deliver ~6-7 GB/s.
 |---------------|-------------------|-----------------|-----------|-------|
 | mmap+memcpy+H2D (original) | ~1.5-2 GB/s | ~400ms | 32s | 0.03 |
 | 3-tier VRAM+RAM (29+51+0) | ~6.5 GB/s (H2D) | ~100ms | 5.3s | 0.2 |
-| **gpu-nvme-direct (20V+30R+30N)** | **3.3 GB/s NVMe** | **~203ms** | **~16s** | **0.06 measured** |
+| gpu-nvme-direct Tier 1 (20V+30R+30N) | 3.3 GB/s NVMe | ~203ms | ~16s | 0.06 |
+| **gpu-nvme-direct BAR1 (20V+30R+30N)** | **3.3 GB/s BAR1→VRAM** | **~201ms** | **~9.5s** | **0.10 measured** |
 | **gpu-nvme-direct (SN740 + B550 Gen4)** | **~6-7 GB/s estimated** | **~100ms** | **~8s** | **0.12** |
 | Warm page cache + H2D | ~13 GB/s | ~52ms | 4.1s | 0.24 |
 
 The real benefit of the NVMe path is for models that **do not fit in RAM** (70B Q8_0 = 70GB > 48GB RAM).
-For 70B Q6_K (56GB): 20 VRAM + 30 RAM + 30 NVMe = 0.06 tok/s measured (vs 0.02 with mmap baseline).
+For 70B Q6_K (56GB): 20 VRAM + 30 RAM + 30 NVMe = 0.10 tok/s measured with BAR1 (vs 0.06 Tier 1, 0.02 mmap baseline).
 
 ### GGUF on NVMe (SN740 = /dev/nvme1n1)
 - **llama-3.1-70b-instruct-q6_k.gguf** (56GB) written with `dd` to LBA 0
@@ -392,3 +393,4 @@ Replace ntransformer's streaming backend with gpu-nvme-direct:
 | Pipeline depth ≥4 timeout | NVMe completions out-of-order; `cq_poll_for_cid` discarded CQEs | Use `cq_poll_completion` (accepts any CID) |
 | I/O SQ/CQ not page-aligned | cudaMallocHost suballocator (after many allocs) | posix_memalign + mlock + cudaHostRegister |
 | PRP lists not page-aligned | Same suballocator issue | Pool allocation with posix_memalign |
+| BAR1 Tier 2 always falls back to Tier 1 | GGUF tensors have sub-LBA offsets (GGML_MEM_ALIGN=32, NVMe block=512) | Bulk read entire LBA span to VRAM temp, D2D scatter to gpu_buf_ |
